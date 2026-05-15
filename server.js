@@ -17,9 +17,10 @@ app.use(express.static('public'));
 app.get('/health', (_req, res) => {
     res.json({
         status: 'ok',
-        version: '3.5.40',
+        version: '3.6.0',
         dashboard: `https://${_req.get('host')}/dashboard`,
         activeEngines: Object.keys(activeEngines).length,
+        hotEngines: hotEngines.size,
         maxEngines: 'Unlimited',
         ramUsageMB: getRamUsageMB(),
         ramTrendMBs: getRamTrend().toFixed(2),
@@ -58,7 +59,7 @@ app.get('/debug', async (_req, res) => {
     } catch (err) {
         results['tpb'] = { status: 'error', message: err.message, code: err.response?.status };
     }
-    res.json({ version: '3.4.0', results });
+    res.json({ version: '3.6.0', results });
 });
 
 // ─── Dashboard ───────────────────────────────────────────
@@ -66,6 +67,7 @@ app.get('/dashboard', (req, res) => {
     const engines = Object.entries(activeEngines).map(([hash, entry]) => ({
         id: hash.substring(0, 8),
         ready: entry.isReady,
+        hot: hotEngines.has(hash),
         activeStreams: entry.activeStreams || 0,
         speed: (entry.engine.swarm.downloadSpeed() / 1024 / 1024).toFixed(2) + ' MB/s',
         peers: entry.engine.swarm.wires.length,
@@ -85,6 +87,7 @@ app.get('/dashboard', (req, res) => {
             .card { background: #1e1e1e; padding: 20px; border-radius: 10px; margin-bottom: 15px; border: 1px solid #333; }
             .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px; }
             .stat { color: #8b5cf6; font-weight: bold; }
+            .hot { color: #22c55e; font-weight: bold; }
             h1 { color: #8b5cf6; margin-bottom: 5px; }
             .mode-badge { display: inline-block; padding: 4px 10px; border-radius: 5px; font-size: 0.8rem; font-weight: bold; margin-left: 10px; background: #8b5cf6; color: #fff; vertical-align: middle; }
             .refresh { font-size: 0.8rem; color: #666; margin-bottom: 20px; }
@@ -93,11 +96,11 @@ app.get('/dashboard', (req, res) => {
     </head>
     <body>
         <h1>📊 Live Stream Monitor <span class="mode-badge">${limits.mode} MODE</span></h1>
-        <div class="refresh">Auto-refreshing every 5 seconds. Active Engines: ${engines.length} / Unlimited (RAM Limit: ${RAM_LIMIT_MB}MB)</div>
+        <div class="refresh">Auto-refreshing every 5s. Active: ${engines.length} / Hot Pool: ${hotEngines.size} / RAM: ${RAM_LIMIT_MB}MB</div>
         <div class="grid">
             ${engines.length ? engines.map(e => `
                 <div class="card">
-                    <div><b>Engine ID:</b> ${e.id}</div>
+                    <div><b>Engine ID:</b> ${e.id} ${e.hot ? '<span class="hot">🔥 HOT</span>' : ''}</div>
                     <div><b>Status:</b> ${e.ready ? '✅ Ready' : '⏳ Connecting'}</div>
                     <div><b>Active Streams:</b> <span class="stat">${e.activeStreams}</span></div>
                     <div><b>Speed:</b> <span class="stat">${e.speed}</span></div>
@@ -113,6 +116,7 @@ app.get('/dashboard', (req, res) => {
     </html>
     `);
 });
+
 // ─── Landing Page ────────────────────────────────────────
 app.get('/', (req, res) => {
     const host = req.get('host') || 'stremio.eletroclay.com';
@@ -212,9 +216,7 @@ app.get('/', (req, res) => {
                 transform: skewX(-20deg);
                 transition: 0.5s;
             }
-            .btn:hover::after {
-                left: 150%;
-            }
+            .btn:hover::after { left: 150%; }
             .btn:hover {
                 transform: translateY(-3px) scale(1.02);
                 box-shadow: 0 15px 35px rgba(139, 92, 246, 0.6);
@@ -232,9 +234,7 @@ app.get('/', (req, res) => {
                 font-size: 1rem;
                 transition: color 0.2s;
             }
-            .link:hover {
-                color: #a78bfa;
-            }
+            .link:hover { color: #a78bfa; }
             .features {
                 display: flex;
                 flex-wrap: wrap;
@@ -272,17 +272,16 @@ app.get('/', (req, res) => {
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg>
                 Install in Stremio
             </a>
-            
             <div class="btn-links">
                 <a href="/dashboard" class="link">📊 Live Monitor</a>
                 <a href="https://github.com/Aswinajay/stremio-addon" target="_blank" class="link">⭐ GitHub</a>
                 <a href="https://www.buymeacoffee.com/withaswin" target="_blank" class="link">☕ Support Me</a>
             </div>
-            
             <div class="features">
                 <div class="feature">⚡ Cloud Proxy</div>
                 <div class="feature">🧠 Hydra Brain Protection</div>
                 <div class="feature">🎬 40+ Aggregated Sources</div>
+                <div class="feature">🔥 Instant Start</div>
             </div>
         </div>
     </body>
@@ -295,18 +294,81 @@ const addonRouter = getRouter(addonInterface);
 app.use(addonRouter);
 
 // ─── Torrent Engine Management ───────────────────────────
-const RAM_LIMIT_MB = parseInt(process.env.RAM_LIMIT_MB) || 300;        // Guardrail (Safe for 512MB RAM)
-const DISK_LIMIT_MB = parseInt(process.env.DISK_LIMIT_MB) || 300;      // /tmp disk guardrail
+const RAM_LIMIT_MB = parseInt(process.env.RAM_LIMIT_MB) || 300;
+const DISK_LIMIT_MB = parseInt(process.env.DISK_LIMIT_MB) || 300;
 const ENGINE_TIMEOUT = 10 * 60 * 1000;
 const CONNECT_TIMEOUT = 90000;
 const ZOMBIE_TIMEOUT = 2 * 60 * 1000;
 const activeEngines = {};
 
-// ─── /tmp Disk Guard ───────────────────────────────────────
+// ─── [NEW] Hot Engine Pool ────────────────────────────────
+// Pre-warmed engines waiting for a user to click play.
+// Key = infoHash, Value = timestamp of when it was added.
+// Engines in this pool are ALSO in activeEngines — this map is just a lookup
+// set so we know which ones were intentionally pre-warmed.
+const hotEngines = new Map();
+const HOT_POOL_TTL = 5 * 60 * 1000; // evict from hot pool after 5 minutes of no play
+
+// ─── [NEW] /warm/:infoHash — Pre-warm endpoint ───────────
+// Call this on hover / catalog load / recommendation click.
+// Fire-and-forget: responds immediately, warms in background.
+app.get('/warm/:infoHash', (req, res) => {
+    const { infoHash } = req.params;
+    if (!infoHash || !/^[0-9a-fA-F]{40}$/.test(infoHash)) {
+        return res.status(400).json({ error: 'Invalid infoHash' });
+    }
+
+    const alreadyHot = hotEngines.has(infoHash) || activeEngines[infoHash]?.isReady;
+    if (!alreadyHot) {
+        console.log(`[Preload] ⚡ Warming engine for ${infoHash.substring(0, 8)}…`);
+        preloadEngine(infoHash);
+    } else {
+        console.log(`[Preload] ✅ Already warm: ${infoHash.substring(0, 8)}`);
+    }
+
+    res.json({
+        status: alreadyHot ? 'already_warm' : 'warming',
+        infoHash,
+        ready: activeEngines[infoHash]?.isReady || false
+    });
+});
+
+// [NEW] Pre-warm a torrent engine in the background.
+// Creates the engine, begins peer discovery, selects the video file,
+// and starts prebuffering — all before the user clicks play.
+function preloadEngine(infoHash) {
+    if (activeEngines[infoHash] || hotEngines.has(infoHash)) return;
+
+    hotEngines.set(infoHash, Date.now());
+
+    // getOrCreateEngine already wires up ready/metadata listeners
+    const { engine } = getOrCreateEngine(infoHash);
+
+    // Force immediate announce to bootstrap peer discovery ASAP
+    try {
+        if (engine.swarm?.announce) engine.swarm.announce();
+        if (engine.discovery?.lookup) engine.discovery.lookup();
+    } catch (e) { /* ignore */ }
+
+    console.log(`[Preload] 🚀 Engine created and peer discovery started: ${infoHash.substring(0, 8)}…`);
+}
+
+// Evict stale entries from the hot pool (no play after TTL)
+setInterval(() => {
+    const now = Date.now();
+    for (const [hash, ts] of hotEngines) {
+        if (now - ts > HOT_POOL_TTL && activeEngines[hash]?.activeStreams === 0) {
+            console.log(`[Preload] 🧹 Hot pool TTL evict: ${hash.substring(0, 8)}…`);
+            hotEngines.delete(hash);
+            destroyEngine(hash);
+        }
+    }
+}, 60 * 1000);
+
+// ─── /tmp Disk Guard ──────────────────────────────────────
 const { execSync } = require('child_process');
 function getTmpDiskMB() {
     try {
-        // du -sm returns MBs for the torrent-stream cache directory
         const out = execSync('du -sm /tmp/torrent-stream 2>/dev/null || echo 0').toString().trim();
         return parseInt(out.split('\t')[0]) || 0;
     } catch (e) { return 0; }
@@ -320,7 +382,6 @@ function purgeTmpIfNeeded() {
         const fs = require('fs');
         if (!fs.existsSync(cacheDir)) return;
         const hashes = fs.readdirSync(cacheDir);
-        // Find hashes NOT currently in activeEngines and delete them
         const activeHashes = new Set(Object.keys(activeEngines));
         for (const hash of hashes) {
             if (!activeHashes.has(hash)) {
@@ -332,13 +393,9 @@ function purgeTmpIfNeeded() {
         }
     } catch (e) { /* ignore */ }
 }
-// Scan /tmp every 60s (safety net — memory storage should prevent disk growth)
 setInterval(purgeTmpIfNeeded, 60 * 1000);
 
-// ─── Memory-Only Piece Storage ──────────────────────────────
-// For a streaming proxy we never need to persist pieces to disk.
-// Pieces live in RAM just long enough to be served over HTTP, then GC'd.
-// This eliminates the /tmp disk exhaustion that caused OOM restarts.
+// ─── Memory-Only Piece Storage ────────────────────────────
 function createMemoryStorage() {
     const MAX_MEMORY_BYTES = 40 * 1024 * 1024; // 40MB buffer per engine
     return function (pieceLength, opts) {
@@ -363,7 +420,7 @@ function createMemoryStorage() {
                 if (typeof opts2 === 'function') { cb = opts2; opts2 = {}; }
                 const entry = store.get(index);
                 if (!entry) return cb(new Error('piece not in memory'));
-                entry.t = Date.now(); // update access time
+                entry.t = Date.now();
                 const buf = entry.buf;
                 const offset = (opts2 && opts2.offset) || 0;
                 const length = (opts2 && opts2.length != null) ? opts2.length : buf.length - offset;
@@ -382,43 +439,34 @@ function createMemoryStorage() {
     };
 }
 
-// ─── Hydra Brain: Advanced Dynamic Resource Controller ───────
-// Tracks RAM trend (velocity) across real-time samples to be PREDICTIVE
+// ─── Hydra Brain ─────────────────────────────────────────
 let _ramHistory = [];
 function recordRamSample() {
     const now = getRamUsageMB();
     _ramHistory.push({ t: Date.now(), v: now });
-    if (_ramHistory.length > 6) _ramHistory.shift(); // keep last 30s
+    if (_ramHistory.length > 6) _ramHistory.shift();
 }
 function getRamTrend() {
-    // Returns MB/s change velocity (positive = climbing, negative = falling)
     if (_ramHistory.length < 2) return 0;
     const oldest = _ramHistory[0];
     const newest = _ramHistory[_ramHistory.length - 1];
     const dtSec = (newest.t - oldest.t) / 1000;
     if (dtSec === 0) return 0;
-    return (newest.v - oldest.v) / dtSec; // MB/sec
+    return (newest.v - oldest.v) / dtSec;
 }
 
 function getDynamicLimits(forInfoHash) {
     recordRamSample();
     const ram = getRamUsageMB();
-    const trend = getRamTrend();   // MB/sec, positive = RAM is rising
+    const trend = getRamTrend();
     const engines = Object.values(activeEngines);
     const numEngines = engines.length || 1;
 
-    // ── 1. Predictive Headroom ──────────────────────────────
-    // Project forward 10s: if RAM is climbing, shrink headroom *now*
     const projectedRam = ram + (trend * 10);
     const effectiveRam = Math.max(ram, Math.min(RAM_LIMIT_MB, projectedRam));
     const headRoom = Math.max(0, RAM_LIMIT_MB - effectiveRam);
-
-    // ── 2. Total Peer Budget (0.7 peers per MB of headroom) ──
     const totalBudget = Math.floor(headRoom * 0.7);
 
-    // ── 3. Per-Engine Weighted Budget ───────────────────────
-    // Engines with active streams get a bigger slice; idle ones get minimal
-    // Weight formula: active ? (1 + avgSpeed) : 0.1
     let perEngineConns;
     if (forInfoHash && activeEngines[forInfoHash]) {
         const me = activeEngines[forInfoHash];
@@ -429,17 +477,13 @@ function getDynamicLimits(forInfoHash) {
         const myShare = totalWeight > 0 ? myWeight / totalWeight : 1 / numEngines;
         perEngineConns = Math.floor(totalBudget * myShare);
     } else {
-        // Generic call (no engine context): even split
         perEngineConns = Math.floor(totalBudget / numEngines);
     }
 
-    // ── 4. Pressure Multiplier ──────────────────────────────
-    // Exponential squeeze as RAM nears the ceiling
     const pressureRatio = Math.max(0, Math.min(1, effectiveRam / RAM_LIMIT_MB));
-    const pressureMultiplier = Math.pow(1 - pressureRatio, 1.5); // 0..1 curve
+    const pressureMultiplier = Math.pow(1 - pressureRatio, 1.5);
     perEngineConns = Math.max(1, Math.min(80, Math.floor(perEngineConns * (0.3 + 0.7 * pressureMultiplier))));
 
-    // ── 5. Mode Label ───────────────────────────────────────
     let mode = 'HIGH';
     if (effectiveRam > 195) mode = 'EMERGENCY';
     else if (effectiveRam > 185) mode = 'CRITICAL';
@@ -463,7 +507,6 @@ function getRamUsageMB() {
 }
 
 function getTrackers() {
-    // Source: ngosang/trackerslist (best + all_udp + all_https) — March 2025
     return [
         // ── Tier 1: Highest traffic ─────────────────────────
         'udp://tracker.opentrackr.org:1337/announce',
@@ -536,7 +579,7 @@ function getTrackers() {
         'udp://tracker.kicks-ass.net:80/announce',
         'udp://tracker.irxh.net:1337/announce',
         'udp://tracker.internetwarriors.net:1337/announce',
-        // ── Tier 4: HTTPS (bypass UDP blocks on Render) ─────
+        // ── Tier 4: HTTPS ───────────────────────────────────
         'https://tracker.zhuqiy.com:443/announce',
         'https://tracker.tamersunion.org:443/announce',
         'https://tracker.nanoha.org:443/announce',
@@ -568,7 +611,6 @@ function evictIfNeeded() {
     const reason = `RAM ${ramMB}MB > ${RAM_LIMIT_MB}MB limit`;
     console.log(`[Engine] Eviction triggered: ${reason}`);
 
-    // Priority 1: Zombie engines (0 speed, 0 active streams)
     const zombie = keys.find(k => {
         const e = activeEngines[k];
         return e.activeStreams === 0 && e.lastNonZeroSpeed && (Date.now() - e.lastNonZeroSpeed > ZOMBIE_TIMEOUT);
@@ -579,7 +621,6 @@ function evictIfNeeded() {
         return;
     }
 
-    // Priority 2: Oldest idle engine (no active streams)
     let oldest = null;
     let oldestTime = Infinity;
     for (const key of keys) {
@@ -594,7 +635,6 @@ function evictIfNeeded() {
         return;
     }
 
-    // Priority 3: Force eviction of slowest engine if in HIGH memory modes
     const critical = limits.mode === 'EMERGENCY' || limits.mode === 'CRITICAL' || overRam;
     if (critical) {
         let slowest = null;
@@ -614,7 +654,6 @@ function destroyEngine(infoHash, force = false) {
     const entry = activeEngines[infoHash];
     if (!entry) return;
 
-    // If there are active streams, don't destroy unless forced (emergency)
     if (entry.activeStreams > 0 && !force) {
         console.log(`[Engine] Postponing destruction for ${infoHash.substring(0, 8)}: ${entry.activeStreams} active streams`);
         resetEngineTimeout(infoHash);
@@ -623,10 +662,10 @@ function destroyEngine(infoHash, force = false) {
 
     clearTimeout(entry.timeout);
     if (entry.logInterval) clearInterval(entry.logInterval);
+    hotEngines.delete(infoHash); // clean up hot pool reference
     delete activeEngines[infoHash];
     console.log(`[Engine] Destroying: ${infoHash.substring(0, 8)}… (active: ${Object.keys(activeEngines).length})`);
 
-    // engine.remove() tears down connections and clears memory storage
     try {
         entry.engine.remove(false, (err) => {
             if (err) {
@@ -645,7 +684,6 @@ function resetEngineTimeout(infoHash) {
     entry.lastAccess = Date.now();
     clearTimeout(entry.timeout);
 
-    // Dynamic Timeout: 10 mins if actively watching, but 3 minutes if abandoned (0 active streams)
     const duration = entry.activeStreams > 0 ? ENGINE_TIMEOUT : 3 * 60 * 1000;
 
     entry.timeout = setTimeout(() => {
@@ -656,27 +694,42 @@ function resetEngineTimeout(infoHash) {
     }, duration);
 }
 
+// ─── [NEW] prebuffer — force first 1MB download start ────
+// Reads the first 1MB of the file to force the torrent engine to begin
+// downloading the initial pieces. This makes the first HTTP chunk available
+// to the player almost instantly instead of waiting for the player's first
+// range request to trigger piece selection.
+function prebuffer(file, infoHashShort) {
+    try {
+        const end = Math.min(1 * 1024 * 1024, file.length - 1); // first 1MB
+        const stream = file.createReadStream({ start: 0, end });
+        stream.on('data', () => {}); // consume to drive download
+        stream.on('end', () => console.log(`[Prebuffer:${infoHashShort}] ✅ First 1MB buffered`));
+        stream.on('error', () => {}); // warm-up errors are non-fatal
+    } catch (e) { /* ignore */ }
+}
+
 function getOrCreateEngine(infoHash) {
     if (activeEngines[infoHash]) {
         resetEngineTimeout(infoHash);
         return { engine: activeEngines[infoHash].engine, isReady: activeEngines[infoHash].isReady };
     }
 
-    // Evict if at capacity
     evictIfNeeded();
 
     const limits = getDynamicLimits(infoHash);
     const magnet = buildMagnet(infoHash);
-    console.log(`[Engine] Creating new engine (${limits.label || limits.mode}, ${limits.connections}c): ${infoHash.substring(0, 8)}…`);
+    const shortHash = infoHash.substring(0, 8);
+    console.log(`[Engine] Creating new engine (${limits.label || limits.mode}, ${limits.connections}c): ${shortHash}…`);
 
     const engine = torrentStream(magnet, {
         tmp: '/tmp/torrent-stream',
         connections: limits.connections,
-        uploads: 0,                 // Do not upload to save bandwidth/CPU
-        verify: false,              // skip piece hash verification to save massive CPU
-        dht: true,                  // Use DHT
-        tracker: true,              // Use trackers
-        storage: createMemoryStorage(), // NO disk writes — pieces live in RAM only
+        uploads: 0,
+        verify: false,
+        dht: true,
+        tracker: true,
+        storage: createMemoryStorage(),
     });
 
     const entry = {
@@ -690,9 +743,38 @@ function getOrCreateEngine(infoHash) {
     activeEngines[infoHash] = entry;
     resetEngineTimeout(infoHash);
 
+    // ─── [NEW] Aggressive peer bootstrap ─────────────────
+    // Force swarm to start connecting immediately when the engine is wired up.
+    // Standard torrent-stream announces on 'ready', which is too late.
+    engine.swarm?.on('connect', () => {
+        try { engine.swarm.resume(); } catch (e) { /* ignore */ }
+    });
+
+    // ─── [NEW] Metadata event — speculative early file selection ─
+    // 'metadata' fires when the torrent's file list becomes known,
+    // BEFORE the full 'ready' event. Selecting the video file here
+    // starts the download pieces ~0.5–2s earlier than waiting for 'ready'.
+    engine.on('metadata', () => {
+        try {
+            if (!engine.files || engine.files.length === 0) return;
+
+            // Deselect everything first
+            engine.files.forEach(f => { try { f.deselect(); } catch (e) {} });
+
+            const videoFile = findVideoFile(engine.files);
+            if (videoFile) {
+                videoFile.select();
+                console.log(`[Engine:${shortHash}] 📂 Early select (metadata): "${videoFile.name}" (${(videoFile.length / 1024 / 1024).toFixed(0)} MB)`);
+
+                // Start prebuffer immediately on file selection — don't wait for ready
+                setTimeout(() => prebuffer(videoFile, shortHash), 100);
+            }
+        } catch (e) { /* ignore */ }
+    });
+
     // ─── Dynamic Speed Manager ───────────────────────────
     entry.lastNonZeroSpeed = Date.now();
-    entry.speedSamples = []; // rolling window of speed samples
+    entry.speedSamples = [];
     let slowPeerEvictionTick = 0;
 
     entry.logInterval = setInterval(() => {
@@ -702,27 +784,20 @@ function getOrCreateEngine(infoHash) {
         const peers = engine.swarm.wires.length;
         const downloaded = (engine.swarm.downloaded / 1024 / 1024).toFixed(2);
 
-        // Track meaningful speed for zombie detection
-        if (parseFloat(speedMb) >= 0.1) {
-            entry.lastNonZeroSpeed = Date.now();
-        }
+        if (parseFloat(speedMb) >= 0.1) entry.lastNonZeroSpeed = Date.now();
 
-        // Rolling speed window
         entry.speedSamples.push(parseFloat(speedMb));
         if (entry.speedSamples.length > 6) entry.speedSamples.shift();
         const avgSpeed = entry.speedSamples.reduce((a, b) => a + b, 0) / entry.speedSamples.length;
 
-        // ── Hydra Brain: Per-engine weighted peer limit ──
         const currentLimits = getDynamicLimits(infoHash);
 
-        // Dynamic Swarm Limit Sync + Recovery Re-announce
         const prevLimit = entry._prevPeerLimit || currentLimits.connections;
         if (engine.swarm.size !== currentLimits.connections) {
             engine.swarm.size = currentLimits.connections;
             if (engine.swarm.maxConnections) engine.swarm.maxConnections = currentLimits.connections;
         }
 
-        // Only re-announce if budget jumped significantly (+10c) AND cooldown (30s) passed
         const budgetJump = currentLimits.connections - prevLimit;
         const timeSinceAnnounce = Date.now() - (entry._lastAnnounce || 0);
         const needsMorePeers = peers < Math.floor(currentLimits.connections * 0.5);
@@ -732,7 +807,7 @@ function getOrCreateEngine(infoHash) {
                 if (engine.discovery?.lookup) engine.discovery.lookup();
                 if (engine.swarm?.resume) engine.swarm.resume();
                 entry._lastAnnounce = Date.now();
-                console.log(`[SpeedMgr:${infoHash.substring(0, 8)}] 📡 Peer Recovery: budget +${budgetJump}c (${prevLimit}c -> ${currentLimits.connections}c), peers: ${peers}`);
+                console.log(`[SpeedMgr:${shortHash}] 📡 Peer Recovery: budget +${budgetJump}c (${prevLimit}c -> ${currentLimits.connections}c), peers: ${peers}`);
             } catch (e) { /* ignore */ }
         }
         entry._prevPeerLimit = currentLimits.connections;
@@ -750,22 +825,20 @@ function getOrCreateEngine(infoHash) {
                     if (aIsValuable !== bIsValuable) return aIsValuable - bIsValuable;
                     return spdA - spdB;
                 });
-
                 let pruned = 0;
                 for (let i = 0; i < excessCount; i++) {
                     if (sortedWires[i]) {
                         const spd = sortedWires[i].downloadSpeed ? sortedWires[i].downloadSpeed() : 0;
                         if (spd >= HOG_THRESHOLD) break;
-                        try { sortedWires[i].destroy(); pruned++; } catch (e) { }
+                        try { sortedWires[i].destroy(); pruned++; } catch (e) {}
                     }
                 }
                 if (pruned > 0) {
-                    console.log(`[SpeedMgr:${infoHash.substring(0, 8)}] ✂️ Pruned ${pruned} slow peers | ${currentLimits.label}`);
+                    console.log(`[SpeedMgr:${shortHash}] ✂️ Pruned ${pruned} slow peers | ${currentLimits.label}`);
                 }
             }
         }
 
-        // ── Slow Peer Eviction (every 30s) ──────
         slowPeerEvictionTick++;
         if (slowPeerEvictionTick >= 6) {
             slowPeerEvictionTick = 0;
@@ -780,24 +853,21 @@ function getOrCreateEngine(infoHash) {
                 } catch (e) { /* ignore */ }
             }
             if (evicted > 0) {
-                console.log(`[SpeedMgr:${infoHash.substring(0, 8)}] 🚫 Evicted ${evicted} slow peers`);
+                console.log(`[SpeedMgr:${shortHash}] 🚫 Evicted ${evicted} slow peers`);
             }
         }
 
-        // Log traffic stats - use ASCII-friendly symbols to avoid encoding issues
         if (parseFloat(speedMb) > 0 || peers > 0) {
             const ramMB = getRamUsageMB();
             const ramWarn = ramMB > (RAM_LIMIT_MB * 0.9) ? ' (!) RAM' : '';
-            const activeStr = entry.activeStreams;
-            console.log(`[Engine:${infoHash.substring(0, 8)}] ⚡ ${speedMb} MB/s | 👥 ${peers}p | ↓ ${downloaded} MB | 👥 ${activeStr} active | avg:${avgSpeed.toFixed(2)}${ramWarn}`);
+            console.log(`[Engine:${shortHash}] ⚡ ${speedMb} MB/s | 👥 ${peers}p | ↓ ${downloaded} MB | 🎬 ${entry.activeStreams} active | avg:${avgSpeed.toFixed(2)}${ramWarn}`);
         }
     }, 5000);
 
-    // Proactive Memory Guard: Scan every 30s
+    // Proactive Memory Guard
     if (!global._zombieScannerStarted) {
         global._zombieScannerStarted = true;
         setInterval(() => {
-            // Force eviction check if over limit
             if (getRamUsageMB() > RAM_LIMIT_MB) {
                 console.log(`[Guard] Proactive RAM Check: ${getRamUsageMB()}MB exceeds ${RAM_LIMIT_MB}MB limit`);
                 evictIfNeeded();
@@ -816,8 +886,6 @@ function getOrCreateEngine(infoHash) {
                     console.log(`[Zombie] Killing slow engine ${hash.substring(0, 8)}… (avg ${avgSpeed.toFixed(2)} MB/s for ${zombieAge}s)`);
                     destroyEngine(hash);
                 } else if (e.activeStreams === 0 && e.speedSamples?.length >= 6) {
-                    // Secondary check: if avg has been below 0.15 MB/s for all 6 samples (30s)
-                    // AND engine is older than 2 minutes, try a DHT re-announce
                     const avgSpeed = e.speedSamples.reduce((a, b) => a + b, 0) / e.speedSamples.length;
                     const age = Date.now() - (e.createdAt || Date.now());
                     if (avgSpeed < 0.15 && age > 120000) {
@@ -833,13 +901,14 @@ function getOrCreateEngine(infoHash) {
         }, 30 * 1000);
     }
 
-    // Mark ready when the engine fires 'ready'
+    // ─── 'ready' event — final confirmation + warm-up ────
     engine.on('ready', () => {
         entry.isReady = true;
-        console.log(`[Engine] Ready: ${infoHash.substring(0, 8)}… (${engine.files.length} files)`);
+        const shortHash = infoHash.substring(0, 8);
+        console.log(`[Engine] Ready: ${shortHash}… (${engine.files.length} files)`);
 
-        // ── Priority: Deselect all, then select only the video ──
-        engine.files.forEach(f => f.deselect());
+        // Deselect all first (metadata handler may have already selected, but be safe)
+        engine.files.forEach(f => { try { f.deselect(); } catch (e) {} });
 
         let bestFile = null;
         let bestSize = 0;
@@ -854,15 +923,15 @@ function getOrCreateEngine(infoHash) {
             bestFile.select();
             console.log(`[Engine] Priority → "${bestFile.name}" (${(bestFile.length / 1024 / 1024).toFixed(0)} MB)`);
 
-            // ── Pre-buffer Warm-up: Read first 2MB to force download start ──
+            // Pre-buffer: first 2MB warm-up (slightly larger than metadata-time prebuffer)
             setTimeout(() => {
                 try {
                     const warmStream = bestFile.createReadStream({ start: 0, end: Math.min(2 * 1024 * 1024, bestFile.length - 1) });
-                    warmStream.on('data', () => { }); // consume to drive the download
-                    warmStream.on('end', () => console.log(`[SpeedMgr:${infoHash.substring(0, 8)}] 🔥 Pre-buffer complete`));
-                    warmStream.on('error', () => { }); // ignore warm-up errors
+                    warmStream.on('data', () => {});
+                    warmStream.on('end', () => console.log(`[SpeedMgr:${shortHash}] 🔥 Pre-buffer complete`));
+                    warmStream.on('error', () => {});
                 } catch (e) { /* ignore */ }
-            }, 200); // slight delay to let file.select() take effect
+            }, 200);
         }
     });
 
@@ -935,7 +1004,6 @@ function serveVideoFile(file, req, res, infoHash) {
 
         console.log(`[Stream] Range: ${start}-${end}/${totalSize} (${(chunkSize / 1024 / 1024).toFixed(1)} MB)`);
 
-        // Add connection keep-alive and disable cache to prevent buffering/drops
         res.writeHead(206, {
             'Content-Range': `bytes ${start}-${end}/${totalSize}`,
             'Accept-Ranges': 'bytes',
@@ -951,13 +1019,10 @@ function serveVideoFile(file, req, res, infoHash) {
             console.error(`[Stream Error] ${infoHash.substring(0, 8)} Read error: ${err.message}`);
             if (!res.headersSent) res.status(500).end();
         });
-        res.on('close', () => {
-            stream.destroy();
-        });
+        res.on('close', () => { stream.destroy(); });
     } else {
         console.log(`[Stream] Full file: ${(totalSize / 1024 / 1024).toFixed(1)} MB`);
 
-        // Add connection keep-alive and disable cache to prevent buffering/drops
         res.writeHead(200, {
             'Content-Length': totalSize,
             'Content-Type': contentType,
@@ -972,13 +1037,13 @@ function serveVideoFile(file, req, res, infoHash) {
             console.error(`[Stream Error] ${infoHash.substring(0, 8)} Read error: ${err.message}`);
             if (!res.headersSent) res.status(500).end();
         });
-        res.on('close', () => {
-            stream.destroy();
-        });
+        res.on('close', () => { stream.destroy(); });
     }
 }
 
-// ─── Stream Proxy Route ─────────────────────────────────
+// ─── Stream Proxy Route ──────────────────────────────────
+// [CHANGED] Zero-wait fast path: if the engine is already warm and the file
+// list is available, serve immediately without waiting for the 'ready' event.
 app.get('/stream/:infoHash', (req, res) => {
     const { infoHash } = req.params;
     const fileIdx = req.query.fileIdx !== undefined ? parseInt(req.query.fileIdx, 10) : undefined;
@@ -987,40 +1052,61 @@ app.get('/stream/:infoHash', (req, res) => {
 
     const { engine, isReady } = getOrCreateEngine(infoHash);
 
-    // Prevent MaxListeners warning — multiple concurrent requests to same engine
     engine.setMaxListeners(30);
 
-    // If engine is already ready (cached), serve immediately
-    if (isReady && engine.files && engine.files.length > 0) {
-        console.log(`[Stream] Engine cached & ready, serving immediately`);
+    // ── [NEW] Zero-wait path ─────────────────────────────
+    // The engine may have file info from the 'metadata' event even if
+    // isReady is not yet set. Check engine.files directly.
+    const filesAvailable = engine.files && engine.files.length > 0;
+
+    if (filesAvailable) {
+        // We have the file list — serve without any wait.
+        // This is the HOT ENGINE path: engine was pre-warmed by /warm/:infoHash
+        // or a previous stream request, so the user gets instant playback.
         const file = findVideoFile(engine.files, fileIdx);
-
         if (!file) {
-            res.status(404).json({ error: 'No video file found in this torrent' });
-            return;
+            return res.status(404).json({ error: 'No video file found in this torrent' });
         }
-
-        console.log(`[Stream] Serving: "${file.name}" (${(file.length / 1024 / 1024).toFixed(1)} MB)`);
-        serveVideoFile(file, req, res, infoHash);
-        return;
+        const label = isReady ? '⚡ HOT (ready)' : '🔥 HOT (metadata)';
+        console.log(`[Stream] ${label} — serving immediately: "${file.name}" (${(file.length / 1024 / 1024).toFixed(1)} MB)`);
+        return serveVideoFile(file, req, res, infoHash);
     }
 
-    // Engine is new — wait for 'ready' event
+    // ── Cold path: wait for ready ────────────────────────
+    // Engine is brand new. Listen for ready, but also check for metadata
+    // so we can respond as soon as we have the file list (not full ready).
     let responded = false;
+
+    // [NEW] Try to serve as soon as metadata arrives — before full ready
+    const onMetadata = () => {
+        if (responded) return;
+        if (!engine.files || engine.files.length === 0) return;
+
+        const file = findVideoFile(engine.files, fileIdx);
+        if (!file) return; // fall through to onReady
+
+        responded = true;
+        clearTimeout(timer);
+        engine.removeListener('ready', onReady);
+        engine.removeListener('error', onError);
+
+        console.log(`[Stream] 🔥 Metadata fast-path: "${file.name}" (${(file.length / 1024 / 1024).toFixed(1)} MB)`);
+        serveVideoFile(file, req, res, infoHash);
+    };
 
     const onReady = () => {
         if (responded) return;
         responded = true;
         clearTimeout(timer);
+        engine.removeListener('metadata', onMetadata);
         engine.removeListener('error', onError);
 
         const file = findVideoFile(engine.files, fileIdx);
         if (!file) {
-            res.status(404).json({ error: 'No video file found in this torrent' });
-            return;
+            return res.status(404).json({ error: 'No video file found in this torrent' });
         }
 
-        console.log(`[Stream] Serving: "${file.name}" (${(file.length / 1024 / 1024).toFixed(1)} MB)`);
+        console.log(`[Stream] Serving (ready): "${file.name}" (${(file.length / 1024 / 1024).toFixed(1)} MB)`);
         serveVideoFile(file, req, res, infoHash);
     };
 
@@ -1029,19 +1115,20 @@ app.get('/stream/:infoHash', (req, res) => {
         if (!responded) {
             responded = true;
             clearTimeout(timer);
+            engine.removeListener('metadata', onMetadata);
             engine.removeListener('ready', onReady);
             if (!res.headersSent) res.status(500).json({ error: 'Torrent engine error' });
         }
     };
 
-    // Use once() to auto-remove after firing, preventing listener leak
+    engine.on('metadata', onMetadata);   // fires earlier than ready
     engine.once('ready', onReady);
     engine.once('error', onError);
 
-    // Timeout
     const timer = setTimeout(() => {
         if (!responded) {
             responded = true;
+            engine.removeListener('metadata', onMetadata);
             engine.removeListener('ready', onReady);
             engine.removeListener('error', onError);
             console.error(`[Stream] Timeout (${CONNECT_TIMEOUT / 1000}s): ${infoHash.substring(0, 8)}…`);
@@ -1051,11 +1138,11 @@ app.get('/stream/:infoHash', (req, res) => {
         }
     }, CONNECT_TIMEOUT);
 
-    // Clean up if client disconnects early
     req.on('close', () => {
         if (!responded) {
             responded = true;
             clearTimeout(timer);
+            engine.removeListener('metadata', onMetadata);
             engine.removeListener('ready', onReady);
             engine.removeListener('error', onError);
         }
@@ -1068,13 +1155,16 @@ app.listen(PORT, () => {
     const baseUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
     console.log(`
 ╔══════════════════════════════════════════════════════╗
-║             🎬 Torrent to weblink 🎬              ║
+║          🎬 Torrent to weblink v3.6.0 🎬          ║
 ╠══════════════════════════════════════════════════════╣
 ║                                                      ║
 ║  Server running on port ${String(PORT).padEnd(28)}  ║
 ║                                                      ║
 ║  Manifest URL:                                       ║
 ║  ${(baseUrl + '/manifest.json').padEnd(52)}║
+║                                                      ║
+║  Warm endpoint:                                      ║
+║  ${(baseUrl + '/warm/:infoHash').padEnd(52)}║
 ║                                                      ║
 ║  Install in Stremio:                                 ║
 ║  Open Stremio → Addons → paste the manifest URL      ║
