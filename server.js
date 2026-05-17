@@ -936,6 +936,30 @@ function serveVideoFile(file, req, res, infoHash) {
 }
 
 // ─── Stream Proxy Route ───────────────────────────────────
+
+// HEAD handler — Stremio sends HEAD before GET to validate the stream URL.
+// Without this, Express falls through to the addon router → 404 → Railway 502.
+// We respond immediately with video headers and also kick off engine pre-warming
+// so that by the time the GET arrives the engine is already connecting peers.
+app.head('/stream/:infoHash', (req, res) => {
+    const { infoHash } = req.params;
+    console.log(`[Stream] HEAD ${infoHash.substring(0, 8)}… — responding immediately + pre-warming`);
+
+    // Pre-warm the engine now so GET arrives to a warm engine
+    if (!activeEngines[infoHash]) {
+        setImmediate(() => getOrCreateEngine(infoHash));
+    }
+
+    res.writeHead(200, {
+        'Content-Type': 'video/mp4',
+        'Accept-Ranges': 'bytes',
+        'Connection': 'keep-alive',
+        'Cache-Control': 'no-store',
+        'X-Accel-Buffering': 'no',
+    });
+    res.end();
+});
+
 app.get('/stream/:infoHash', (req, res) => {
     const { infoHash } = req.params;
     const fileIdx = req.query.fileIdx !== undefined ? parseInt(req.query.fileIdx, 10) : undefined;
