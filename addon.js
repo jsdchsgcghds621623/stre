@@ -36,30 +36,24 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
+// ─── Pre-warm callback (set by server.js) ────────────────
+// server.js registers this callback so addon can trigger engine
+// pre-warming the moment streams are generated — before the user clicks play.
+let _warmEngineCallback = null;
+function setWarmEngineCallback(fn) {
+    _warmEngineCallback = fn;
+}
+
 // ─── Helpers ─────────────────────────────────────────────
-
-// FIX: getBaseUrl now checks all common deployment platforms in order.
-// Railway sets RAILWAY_PUBLIC_DOMAIN (just the hostname, no protocol).
-// We also honour a generic BASE_URL env var so any platform works with
-// one environment variable, without touching this file again.
 function getBaseUrl() {
-    // 1. Explicit override — works on any host, highest priority
     if (process.env.BASE_URL) return process.env.BASE_URL.replace(/\/$/, '');
-
-    // 2. Railway — set automatically by Railway
     if (process.env.RAILWAY_PUBLIC_DOMAIN)
         return `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
-
-    // 3. Render — set automatically by Render
     if (process.env.RENDER_EXTERNAL_URL) return process.env.RENDER_EXTERNAL_URL;
-
-    // 4. Hugging Face Spaces
     if (process.env.SPACE_ID) {
         const [user, name] = process.env.SPACE_ID.toLowerCase().split('/');
         return `https://${user}-${name.replace(/\//g, '-')}.hf.space`;
     }
-
-    // 5. Local fallback
     const port = process.env.PORT || 3000;
     return `http://localhost:${port}`;
 }
@@ -115,7 +109,7 @@ async function getMeta(imdbId, type = 'movie') {
 }
 
 // ═══════════════════════════════════════════════════════════
-// ───  MOVIE SOURCES
+// ─── MOVIE SOURCES ─────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════
 
 async function ytsImdbLookup(imdbId) {
@@ -346,8 +340,7 @@ async function fetchTorrentio(type, id) {
                 const lines = s.title ? s.title.split('\n') : [];
                 const qualityMatch = s.name?.match(/(?:Torrentio|TorrentsDB)\s+(.+)/i);
                 const quality = qualityMatch ? qualityMatch[1] : '?';
-                let size = '';
-                let seeds = 0;
+                let size = '', seeds = 0;
                 const sizeMatch = s.title?.match(/💾\s*([^👥👤\n]+)/);
                 if (sizeMatch) size = sizeMatch[1].trim();
                 const seedsMatch = s.title?.match(/[👤👥]\s*(\d+)/);
@@ -426,6 +419,15 @@ function buildStreams(torrents, baseUrl) {
         return (b.seeds || 0) - (a.seeds || 0);
     });
 
+    // ─── Pre-warm top engines ─────────────────────────────
+    // Fire pre-warming for the top 3 torrents by quality/seeds so engines are
+    // already connecting by the time the user clicks play on one of them.
+    if (_warmEngineCallback) {
+        uniqueTorrents.slice(0, 3).forEach(t => {
+            try { _warmEngineCallback(t.hash); } catch (e) { /* ignore */ }
+        });
+    }
+
     return uniqueTorrents.map(t => {
         const quality = t.quality || parseQuality(t.title);
         let info = '';
@@ -448,11 +450,8 @@ function buildStreams(torrents, baseUrl) {
 builder.defineStreamHandler(async ({ type, id }) => {
     console.log(`\n[Stream] type=${type} id=${id}`);
 
-    // FIX: baseUrl is resolved once per request, at handler time (not module load).
-    // This means if BASE_URL or RAILWAY_PUBLIC_DOMAIN is set after the process
-    // starts (e.g. late env injection), it is still picked up correctly.
     const baseUrl = getBaseUrl();
-    console.log(`[Stream] baseUrl = ${baseUrl}`);   // visible in Railway logs for debugging
+    console.log(`[Stream] baseUrl = ${baseUrl}`);
 
     try {
         if (type === 'movie') {
@@ -561,4 +560,9 @@ builder.defineStreamHandler(async ({ type, id }) => {
     }
 });
 
-module.exports = builder.getInterface();
+const addonInterface = builder.getInterface();
+
+// Export both the interface and the warm callback setter
+addonInterface.setWarmEngineCallback = setWarmEngineCallback;
+
+module.exports = addonInterface;
