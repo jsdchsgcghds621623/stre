@@ -3,6 +3,7 @@ const cors = require('cors');
 const torrentStream = require('torrent-stream');
 const addonInterface = require('./addon');
 const { getRouter } = require('stremio-addon-sdk');
+const { spawn } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -35,7 +36,7 @@ if (addonInterface.setWarmEngineCallback) {
 app.get('/health', (_req, res) => {
     res.json({
         status: 'ok',
-        version: '3.5.40',
+        version: '3.5.41',
         dashboard: `https://${_req.get('host')}/dashboard`,
         activeEngines: Object.keys(activeEngines).length,
         maxEngines: 'Unlimited',
@@ -60,7 +61,7 @@ if (SELF_URL) {
     setInterval(async () => {
         try { await axios.get(SELF_URL, { timeout: 5000 }); }
         catch (e) { /* ignore */ }
-    }, 4 * 60 * 1000); // ping every 4 minutes
+    }, 4 * 60 * 1000);
 }
 
 // ─── Debug: test API connectivity ────────────────────────
@@ -90,7 +91,7 @@ app.get('/debug', async (_req, res) => {
     } catch (err) {
         results['tpb'] = { status: 'error', message: err.message, code: err.response?.status };
     }
-    res.json({ version: '3.5.40', results });
+    res.json({ version: '3.5.41', results });
 });
 
 // ─── Dashboard ───────────────────────────────────────────
@@ -310,6 +311,7 @@ app.get('/', (req, res) => {
                 <div class="feature">⚡ Cloud Proxy</div>
                 <div class="feature">🧠 Hydra Brain Protection</div>
                 <div class="feature">🎬 40+ Aggregated Sources</div>
+                <div class="feature">🔄 MKV→MP4 Remux</div>
             </div>
         </div>
     </body>
@@ -655,7 +657,7 @@ function getOrCreateEngine(infoHash) {
         connections: limits.connections,
         uploads: 0,
         verify: true,
-        dht: false,       // ← disabled: DHT adds 3–10s cold-start latency, trackers are enough
+        dht: false,
         tracker: true,
         storage: createMemoryStorage(),
     });
@@ -864,8 +866,112 @@ function findVideoFile(files, fileIdx) {
     return bestFile;
 }
 
+// ─── MKV/WebM → MP4 Real-Time Remux via FFmpeg ───────────
+// Container swap only — zero re-encoding, near-zero CPU overhead.
+// Outputs fragmented MP4 so Stremio can start playback immediately.
+// NOTE: Range/seek requests are not supported through the remux pipeline;
+//       Stremio degrades gracefully to sequential streaming.
+function remuxToMp4(file, req, res, infoHash) {
+    resetEngineTimeout(infoHash);
+
+    const entry = activeEngines[infoHash];
+    if (entry) entry.activeStreams++;
+
+    req.on('close', () => {
+        if (entry) {
+            entry.activeStreams = Math.max(0, entry.activeStreams - 1);
+            resetEngineTimeout(infoHash);
+        }
+    });
+
+    console.log(`[Remux] MKV→MP4 start: "${file.name}" (${(file.length / 1024 / 1024).toFixed(0)} MB)`);
+
+    // Spawn ffmpeg: stdin ← torrent stream, stdout → HTTP response
+    const ffmpeg = spawn('ffmpeg', [
+        '-re',                   // read at native framerate — prevents buffer floods
+        '-i', 'pipe:0',          // input from stdin (torrent stream)
+        '-map', '0:v:0',         // first video track
+        '-map', '0:a:0',         // first audio track
+        '-c', 'copy',            // NO re-encoding — rewrap container only
+        '-movflags', 'frag_keyframe+empty_moov+faststart+default_base_moof',
+        '-f', 'mp4',             // output as MP4
+        'pipe:1',                // output to stdout
+    ], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+    // Respond with chunked MP4 — no Content-Length since size is unknown until remux completes
+    res.writeHead(200, {
+        'Content-Type':      'video/mp4',
+        'Transfer-Encoding': 'chunked',
+        'Connection':        'keep-alive',
+        'Cache-Control':     'no-store',
+        'X-Accel-Buffering': 'no',
+    });
+
+    // Pipe torrent data → ffmpeg stdin
+    const torrentReadStream = file.createReadStream({ highWaterMark: 4 * 1024 * 1024 });
+    torrentReadStream.pipe(ffmpeg.stdin);
+
+    // Pipe ffmpeg stdout → HTTP response
+    ffmpeg.stdout.pipe(res);
+
+    // Log only meaningful ffmpeg output — suppress per-frame spam
+    ffmpeg.stderr.on('data', (data) => {
+        const lines = data.toString().split('\n');
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            // Log errors and periodic progress (fps= lines appear every ~1s)
+            if (trimmed.includes('Error') || trimmed.includes('Invalid') ||
+                trimmed.includes('No such') || trimmed.startsWith('fps=')) {
+                console.log(`[FFmpeg:${infoHash.substring(0, 8)}] ${trimmed}`);
+            }
+        }
+    });
+
+    ffmpeg.on('error', (err) => {
+        console.error(`[Remux] FFmpeg spawn error (is ffmpeg installed?): ${err.message}`);
+        if (!res.writableEnded) res.end();
+    });
+
+    ffmpeg.on('close', (code) => {
+        console.log(`[Remux] FFmpeg exited (code ${code}): ${infoHash.substring(0, 8)}…`);
+        if (!res.writableEnded) res.end();
+    });
+
+    // Client disconnected — kill ffmpeg immediately to free resources
+    res.on('close', () => {
+        console.log(`[Remux] Client disconnected — killing ffmpeg: ${infoHash.substring(0, 8)}…`);
+        torrentReadStream.destroy();
+        try { ffmpeg.stdin.destroy(); } catch (e) { /* ignore */ }
+        try { ffmpeg.kill('SIGKILL'); } catch (e) { /* ignore */ }
+    });
+
+    torrentReadStream.on('error', (err) => {
+        console.error(`[Remux] Torrent read error: ${err.message}`);
+        try { ffmpeg.kill('SIGKILL'); } catch (e) { /* ignore */ }
+        if (!res.writableEnded) res.end();
+    });
+
+    ffmpeg.stdin.on('error', (err) => {
+        // EPIPE is expected when ffmpeg exits before stdin is fully consumed — ignore it
+        if (err.code !== 'EPIPE') {
+            console.error(`[Remux] stdin error: ${err.message}`);
+        }
+    });
+}
+
 // ─── Serve video file with Range support ─────────────────
 function serveVideoFile(file, req, res, infoHash) {
+    const ext = file.name.split('.').pop().toLowerCase();
+
+    // MKV and WebM containers → remux to fragmented MP4
+    // Stremio's built-in player cannot handle MKV/WebM natively
+    if (ext === 'mkv' || ext === 'webm') {
+        console.log(`[Stream] .${ext} detected — routing to remux pipeline: "${file.name}"`);
+        return remuxToMp4(file, req, res, infoHash);
+    }
+
+    // ── Native MP4/AVI/etc: serve directly with Range support ──
     resetEngineTimeout(infoHash);
 
     const entry = activeEngines[infoHash];
@@ -879,7 +985,6 @@ function serveVideoFile(file, req, res, infoHash) {
     });
 
     const totalSize = file.length;
-    const ext = file.name.split('.').pop().toLowerCase();
     const mimeTypes = {
         mp4: 'video/mp4', mkv: 'video/x-matroska', avi: 'video/x-msvideo',
         mov: 'video/quicktime', wmv: 'video/x-ms-wmv', flv: 'video/x-flv',
@@ -935,26 +1040,25 @@ function serveVideoFile(file, req, res, infoHash) {
     }
 }
 
-// ─── Stream Proxy Route ───────────────────────────────────
+// ─── Stream Proxy Routes ──────────────────────────────────
 
-// HEAD handler — Stremio sends HEAD before GET to validate the stream URL.
-// Without this, Express falls through to the addon router → 404 → Railway 502.
-// We respond immediately with video headers and also kick off engine pre-warming
-// so that by the time the GET arrives the engine is already connecting peers.
+// HEAD handler — Stremio probes this before GET to validate the URL.
+// Respond immediately with MP4 headers (covers MKV too since we remux)
+// and kick off engine pre-warming so GET arrives to a warm engine.
 app.head('/stream/:infoHash', (req, res) => {
     const { infoHash } = req.params;
     console.log(`[Stream] HEAD ${infoHash.substring(0, 8)}… — responding immediately + pre-warming`);
 
-    // Pre-warm the engine now so GET arrives to a warm engine
     if (!activeEngines[infoHash]) {
         setImmediate(() => getOrCreateEngine(infoHash));
     }
 
+    // Always advertise MP4 — MKV files are remuxed transparently
     res.writeHead(200, {
-        'Content-Type': 'video/mp4',
-        'Accept-Ranges': 'bytes',
-        'Connection': 'keep-alive',
-        'Cache-Control': 'no-store',
+        'Content-Type':      'video/mp4',
+        'Accept-Ranges':     'bytes',
+        'Connection':        'keep-alive',
+        'Cache-Control':     'no-store',
         'X-Accel-Buffering': 'no',
     });
     res.end();
@@ -966,7 +1070,7 @@ app.get('/stream/:infoHash', (req, res) => {
 
     console.log(`[Stream] GET ${infoHash.substring(0, 8)}… fileIdx=${fileIdx}`);
 
-    // Kill all socket-level timeouts immediately — before any async work
+    // Kill all socket-level timeouts immediately
     req.socket.setTimeout(0);
     req.socket.setKeepAlive(true, 1000);
     res.setTimeout(0);
@@ -974,9 +1078,7 @@ app.get('/stream/:infoHash', (req, res) => {
     const { engine, isReady } = getOrCreateEngine(infoHash);
     engine.setMaxListeners(30);
 
-    // ─── Fast path: engine pre-warmed and ready ───────────
-    // HEAD handler already started this engine; if it's ready serve instantly
-    // with proper 206 range support — no chunked dance needed.
+    // ── Fast path: engine already ready (pre-warmed by HEAD) ─
     if (isReady && engine.files?.length > 0) {
         console.log(`[Stream] ✅ Pre-warmed hit — serving instantly`);
         const file = findVideoFile(engine.files, fileIdx);
@@ -984,61 +1086,19 @@ app.get('/stream/:infoHash', (req, res) => {
         return serveVideoFile(file, req, res, infoHash);
     }
 
-    // ─── Slow path ────────────────────────────────────────
-    // Railway's proxy kills connections that don't receive response headers
-    // within ~5 seconds of the TCP handshake. We MUST write headers NOW —
-    // synchronously, before any await/setTimeout — then keep the socket alive
-    // with real bytes while the torrent engine connects peers.
-    //
-    // Strategy:
-    //   1. Write 200 + chunked headers RIGHT NOW (synchronous, 0ms)
-    //   2. Send a real keepalive byte every 2s so Railway sees traffic
-    //   3. When engine fires 'ready': stop heartbeat, end this response cleanly
-    //   4. Stremio auto-retries → hits fast path above with range support
-    //
-    // Why chunked then retry instead of waiting?
-    // Once headers are sent as chunked, we can't switch to Content-Length/Range
-    // on the same response. Ending + letting Stremio retry is the cleanest path.
-
+    // ── Slow path: wait for engine ready, then serve directly ─
+    // Hold the connection open (res.setTimeout(0) is already set).
+    // Once ready, call serveVideoFile directly — no chunked dance,
+    // no retry needed. MP4 files get proper 206 range support;
+    // MKV files go through the remux pipeline.
     let responded = false;
-    let heartbeat = null;
-
-    // ── Step 1: headers RIGHT NOW, synchronously ──────────
-    console.log(`[Stream] ⏳ Cold engine — sending immediate headers: ${infoHash.substring(0, 8)}…`);
-    res.writeHead(200, {
-        'Content-Type':      'video/mp4',
-        'Transfer-Encoding': 'chunked',
-        'Connection':        'keep-alive',
-        'Keep-Alive':        'timeout=120, max=1000',
-        'Cache-Control':     'no-store',
-        'X-Accel-Buffering': 'no',   // stop nginx buffering on Railway
-    });
-
-    // ── Step 2: real keepalive bytes every 2s ─────────────
-    // Must be Buffer — string write of '' is a Node no-op (zero bytes sent).
-    // 0x20 (space) is safer than 0x00 for any intermediate proxy that inspects
-    // content; video players discard pre-stream garbage bytes harmlessly.
-    heartbeat = setInterval(() => {
-        try {
-            if (!res.writableEnded && !res.destroyed) {
-                res.write(Buffer.from([0x20]));
-            } else {
-                clearInterval(heartbeat);
-            }
-        } catch (e) {
-            clearInterval(heartbeat);
-            heartbeat = null;
-        }
-    }, 2000);
 
     const cleanup = () => {
-        if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
         engine.removeListener('ready', onReady);
         engine.removeListener('error', onError);
         clearTimeout(timer);
     };
 
-    // ── Step 3: engine ready → close this response ────────
     const onReady = () => {
         if (responded) return;
         responded = true;
@@ -1047,14 +1107,11 @@ app.get('/stream/:infoHash', (req, res) => {
         const file = findVideoFile(engine.files, fileIdx);
         if (!file) {
             console.error(`[Stream] No video file found: ${infoHash.substring(0, 8)}…`);
-            res.end();
-            return;
+            return res.status(404).json({ error: 'No video file found in this torrent' });
         }
 
-        // End the chunked response — Stremio will immediately retry GET
-        // and hit the fast path above (engine is now isReady === true).
-        console.log(`[Stream] ✅ Engine ready — closing chunked response, retry will range-serve: "${file.name}"`);
-        res.end();
+        console.log(`[Stream] ✅ Engine ready — serving: "${file.name}"`);
+        serveVideoFile(file, req, res, infoHash);
     };
 
     const onError = (err) => {
@@ -1062,19 +1119,21 @@ app.get('/stream/:infoHash', (req, res) => {
         responded = true;
         cleanup();
         console.error(`[Engine Error] ${infoHash.substring(0, 8)}: ${err.message}`);
-        res.end();
+        if (!res.headersSent) res.status(500).json({ error: 'Engine error' });
+        else res.end();
     };
 
     engine.once('ready', onReady);
     engine.once('error', onError);
 
-    // ── Timeout: bail after 75s ───────────────────────────
+    // Bail after 75s — Railway proxy kills idle connections at ~100s
     const timer = setTimeout(() => {
         if (responded) return;
         responded = true;
         cleanup();
         console.error(`[Stream] ⏰ Timeout (75s): ${infoHash.substring(0, 8)}…`);
-        res.end();
+        if (!res.headersSent) res.status(504).json({ error: 'Engine timed out connecting to peers' });
+        else res.end();
     }, CONNECT_TIMEOUT);
 
     req.on('close', () => {
