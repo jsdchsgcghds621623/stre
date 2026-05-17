@@ -964,16 +964,19 @@ app.get('/stream/:infoHash', (req, res) => {
     const { infoHash } = req.params;
     const fileIdx = req.query.fileIdx !== undefined ? parseInt(req.query.fileIdx, 10) : undefined;
 
-    console.log(`[Stream] Request for ${infoHash.substring(0, 8)}… fileIdx=${fileIdx}`);
+    console.log(`[Stream] GET ${infoHash.substring(0, 8)}… fileIdx=${fileIdx}`);
 
-    // Prevent socket-level timeout — Railway/nginx must not kill idle connections
+    // Kill all socket-level timeouts immediately — before any async work
     req.socket.setTimeout(0);
+    req.socket.setKeepAlive(true, 1000);
     res.setTimeout(0);
 
     const { engine, isReady } = getOrCreateEngine(infoHash);
     engine.setMaxListeners(30);
 
-    // ─── Fast path: engine was pre-warmed and ready ───────
+    // ─── Fast path: engine pre-warmed and ready ───────────
+    // HEAD handler already started this engine; if it's ready serve instantly
+    // with proper 206 range support — no chunked dance needed.
     if (isReady && engine.files?.length > 0) {
         console.log(`[Stream] ✅ Pre-warmed hit — serving instantly`);
         const file = findVideoFile(engine.files, fileIdx);
@@ -981,63 +984,61 @@ app.get('/stream/:infoHash', (req, res) => {
         return serveVideoFile(file, req, res, infoHash);
     }
 
-    // ─── Slow path: send keepalive headers immediately ────
-    // This prevents Railway/Stremio from declaring a 502 while we wait for peers.
-    let headersWritten = false;
-    let heartbeat = null;
+    // ─── Slow path ────────────────────────────────────────
+    // Railway's proxy kills connections that don't receive response headers
+    // within ~5 seconds of the TCP handshake. We MUST write headers NOW —
+    // synchronously, before any await/setTimeout — then keep the socket alive
+    // with real bytes while the torrent engine connects peers.
+    //
+    // Strategy:
+    //   1. Write 200 + chunked headers RIGHT NOW (synchronous, 0ms)
+    //   2. Send a real keepalive byte every 2s so Railway sees traffic
+    //   3. When engine fires 'ready': stop heartbeat, end this response cleanly
+    //   4. Stremio auto-retries → hits fast path above with range support
+    //
+    // Why chunked then retry instead of waiting?
+    // Once headers are sent as chunked, we can't switch to Content-Length/Range
+    // on the same response. Ending + letting Stremio retry is the cleanest path.
+
     let responded = false;
+    let heartbeat = null;
 
-    const sendEarlyHeaders = () => {
-        if (headersWritten || res.headersSent) return;
-        headersWritten = true;
-        console.log(`[Stream] ⏳ Sending early headers to keep connection alive: ${infoHash.substring(0, 8)}…`);
-        // Note: no Accept-Ranges here — chunked encoding and range requests are
-        // mutually exclusive. Accept-Ranges is set in serveVideoFile on the retry.
-        res.writeHead(200, {
-            'Content-Type': 'video/mp4',
-            'Transfer-Encoding': 'chunked',
-            'Connection': 'keep-alive',
-            'Keep-Alive': 'timeout=120, max=1000',
-            'Cache-Control': 'no-store',
-            'X-Accel-Buffering': 'no',
-        });
-    };
+    // ── Step 1: headers RIGHT NOW, synchronously ──────────
+    console.log(`[Stream] ⏳ Cold engine — sending immediate headers: ${infoHash.substring(0, 8)}…`);
+    res.writeHead(200, {
+        'Content-Type':      'video/mp4',
+        'Transfer-Encoding': 'chunked',
+        'Connection':        'keep-alive',
+        'Keep-Alive':        'timeout=120, max=1000',
+        'Cache-Control':     'no-store',
+        'X-Accel-Buffering': 'no',   // stop nginx buffering on Railway
+    });
 
-    const startHeartbeat = () => {
-        if (heartbeat) return;
-        // res.write('') is a Node.js no-op — it sends zero bytes and Railway
-        // sees silence, triggering its idle-connection 502 kill.
-        // We must write REAL bytes. A single null byte (0x00) is invisible to
-        // video players (it lands before any media headers are parsed) but keeps
-        // the TCP connection alive from Railway's perspective.
-        // We write it every 3s — well inside any proxy idle timeout.
-        heartbeat = setInterval(() => {
-            try {
-                if (!res.writableEnded && !res.destroyed) {
-                    res.write(Buffer.from([0x00])); // 1 real byte — keeps Railway alive
-                }
-            } catch (e) {
+    // ── Step 2: real keepalive bytes every 2s ─────────────
+    // Must be Buffer — string write of '' is a Node no-op (zero bytes sent).
+    // 0x20 (space) is safer than 0x00 for any intermediate proxy that inspects
+    // content; video players discard pre-stream garbage bytes harmlessly.
+    heartbeat = setInterval(() => {
+        try {
+            if (!res.writableEnded && !res.destroyed) {
+                res.write(Buffer.from([0x20]));
+            } else {
                 clearInterval(heartbeat);
-                heartbeat = null;
             }
-        }, 3000);
-    };
-
-    // Send early headers at 500ms — faster than before, Railway's idle kill
-    // can fire in as little as 2s on cold connections
-    const earlyHeaderTimer = setTimeout(() => {
-        sendEarlyHeaders();
-        startHeartbeat();
-    }, 500);
+        } catch (e) {
+            clearInterval(heartbeat);
+            heartbeat = null;
+        }
+    }, 2000);
 
     const cleanup = () => {
-        clearTimeout(earlyHeaderTimer);
-        clearTimeout(timer);
         if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
         engine.removeListener('ready', onReady);
         engine.removeListener('error', onError);
+        clearTimeout(timer);
     };
 
+    // ── Step 3: engine ready → close this response ────────
     const onReady = () => {
         if (responded) return;
         responded = true;
@@ -1046,47 +1047,34 @@ app.get('/stream/:infoHash', (req, res) => {
         const file = findVideoFile(engine.files, fileIdx);
         if (!file) {
             console.error(`[Stream] No video file found: ${infoHash.substring(0, 8)}…`);
-            if (!res.headersSent) res.status(404).json({ error: 'No video file found in this torrent' });
-            else res.end();
-            return;
-        }
-
-        console.log(`[Stream] ✅ Engine ready — serving: "${file.name}" (${(file.length / 1024 / 1024).toFixed(1)} MB)`);
-
-        if (headersWritten) {
-            // We already sent chunked headers; range requests aren't possible on this response.
-            // End cleanly — Stremio will retry immediately and hit the fast (pre-warmed) path.
-            console.log(`[Stream] ℹ️ Chunked headers already sent — closing, retry will be instant`);
             res.end();
             return;
         }
 
-        // Headers not yet sent — serve normally with full range support
-        serveVideoFile(file, req, res, infoHash);
+        // End the chunked response — Stremio will immediately retry GET
+        // and hit the fast path above (engine is now isReady === true).
+        console.log(`[Stream] ✅ Engine ready — closing chunked response, retry will range-serve: "${file.name}"`);
+        res.end();
     };
 
     const onError = (err) => {
         if (responded) return;
         responded = true;
         cleanup();
-        console.error(`[Engine Error] ${err.message}`);
-        if (!res.headersSent) res.status(500).json({ error: 'Torrent engine error' });
-        else res.end();
+        console.error(`[Engine Error] ${infoHash.substring(0, 8)}: ${err.message}`);
+        res.end();
     };
 
     engine.once('ready', onReady);
     engine.once('error', onError);
 
+    // ── Timeout: bail after 75s ───────────────────────────
     const timer = setTimeout(() => {
         if (responded) return;
         responded = true;
         cleanup();
-        console.error(`[Stream] ⏰ Timeout (${CONNECT_TIMEOUT / 1000}s): ${infoHash.substring(0, 8)}…`);
-        if (!res.headersSent) {
-            res.status(504).json({ error: 'Torrent timed out — try a lower quality with more seeders' });
-        } else {
-            res.end();
-        }
+        console.error(`[Stream] ⏰ Timeout (75s): ${infoHash.substring(0, 8)}…`);
+        res.end();
     }, CONNECT_TIMEOUT);
 
     req.on('close', () => {
