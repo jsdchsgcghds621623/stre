@@ -13,6 +13,24 @@ app.use(cors());
 // ─── Static Files ────────────────────────────────────────
 app.use(express.static('public'));
 
+// ─── Torrent Engine Management ───────────────────────────
+const RAM_LIMIT_MB = parseInt(process.env.RAM_LIMIT_MB) || 300;
+const DISK_LIMIT_MB = parseInt(process.env.DISK_LIMIT_MB) || 300;
+const ENGINE_TIMEOUT = 30 * 60 * 1000;
+const CONNECT_TIMEOUT = 75000; // 75s — Railway kills at ~100s, we bail first
+const ZOMBIE_TIMEOUT = 2 * 60 * 1000;
+const activeEngines = {};
+
+// ─── Wire up pre-warm callback from addon ────────────────
+if (addonInterface.setWarmEngineCallback) {
+    addonInterface.setWarmEngineCallback((hash) => {
+        if (!activeEngines[hash]) {
+            console.log(`[Warm] Pre-warming engine: ${hash.substring(0, 8)}…`);
+            setImmediate(() => getOrCreateEngine(hash));
+        }
+    });
+}
+
 // ─── Health check ────────────────────────────────────────
 app.get('/health', (_req, res) => {
     res.json({
@@ -30,8 +48,22 @@ app.get('/health', (_req, res) => {
     });
 });
 
-// ─── Debug: test API connectivity ────────────────────────
+// ─── Self-ping to prevent Railway sleep ──────────────────
 const axios = require('axios');
+const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/health`
+    : process.env.RENDER_EXTERNAL_URL
+        ? `${process.env.RENDER_EXTERNAL_URL}/health`
+        : null;
+
+if (SELF_URL) {
+    setInterval(async () => {
+        try { await axios.get(SELF_URL, { timeout: 5000 }); }
+        catch (e) { /* ignore */ }
+    }, 4 * 60 * 1000); // ping every 4 minutes
+}
+
+// ─── Debug: test API connectivity ────────────────────────
 app.get('/debug', async (_req, res) => {
     const results = {};
     for (const mirror of ['https://yts.torrentbay.st', 'https://movies-api.accel.li']) {
@@ -58,7 +90,7 @@ app.get('/debug', async (_req, res) => {
     } catch (err) {
         results['tpb'] = { status: 'error', message: err.message, code: err.response?.status };
     }
-    res.json({ version: '3.4.0', results });
+    res.json({ version: '3.5.40', results });
 });
 
 // ─── Dashboard ───────────────────────────────────────────
@@ -113,6 +145,7 @@ app.get('/dashboard', (req, res) => {
     </html>
     `);
 });
+
 // ─── Landing Page ────────────────────────────────────────
 app.get('/', (req, res) => {
     const host = req.get('host') || 'stremio.eletroclay.com';
@@ -212,9 +245,7 @@ app.get('/', (req, res) => {
                 transform: skewX(-20deg);
                 transition: 0.5s;
             }
-            .btn:hover::after {
-                left: 150%;
-            }
+            .btn:hover::after { left: 150%; }
             .btn:hover {
                 transform: translateY(-3px) scale(1.02);
                 box-shadow: 0 15px 35px rgba(139, 92, 246, 0.6);
@@ -232,9 +263,7 @@ app.get('/', (req, res) => {
                 font-size: 1rem;
                 transition: color 0.2s;
             }
-            .link:hover {
-                color: #a78bfa;
-            }
+            .link:hover { color: #a78bfa; }
             .features {
                 display: flex;
                 flex-wrap: wrap;
@@ -272,13 +301,11 @@ app.get('/', (req, res) => {
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg>
                 Install in Stremio
             </a>
-            
             <div class="btn-links">
                 <a href="/dashboard" class="link">📊 Live Monitor</a>
                 <a href="https://github.com/Aswinajay/stremio-addon" target="_blank" class="link">⭐ GitHub</a>
                 <a href="https://www.buymeacoffee.com/withaswin" target="_blank" class="link">☕ Support Me</a>
             </div>
-            
             <div class="features">
                 <div class="feature">⚡ Cloud Proxy</div>
                 <div class="feature">🧠 Hydra Brain Protection</div>
@@ -294,15 +321,7 @@ app.get('/', (req, res) => {
 const addonRouter = getRouter(addonInterface);
 app.use(addonRouter);
 
-// ─── Torrent Engine Management ───────────────────────────
-const RAM_LIMIT_MB = parseInt(process.env.RAM_LIMIT_MB) || 300;
-const DISK_LIMIT_MB = parseInt(process.env.DISK_LIMIT_MB) || 300;
-const ENGINE_TIMEOUT = 30 * 60 * 1000;          // FIX #1: 30 min (was 10) — survives long pauses
-const CONNECT_TIMEOUT = 90000;
-const ZOMBIE_TIMEOUT = 2 * 60 * 1000;
-const activeEngines = {};
-
-// ─── /tmp Disk Guard ───────────────────────────────────────
+// ─── /tmp Disk Guard ─────────────────────────────────────
 const { execSync } = require('child_process');
 function getTmpDiskMB() {
     try {
@@ -332,14 +351,7 @@ function purgeTmpIfNeeded() {
 }
 setInterval(purgeTmpIfNeeded, 60 * 1000);
 
-// ─── Memory-Only Piece Storage ──────────────────────────────
-// FIX #2: Buffer raised from 40MB → 128MB.
-// At 40MB, a 1080p stream at ~4 MB/s fills the buffer in ~10 seconds — 
-// any seek or re-request for an evicted piece causes the infinite-spinner.
-// 128MB gives ~30 seconds of lookahead for most qualities.
-// If your host has 512MB RAM and RAM_LIMIT_MB=300, this is safe:
-//   128MB piece cache + ~80MB Node.js overhead + ~90MB headroom = ~300MB total.
-// For 4K (8–20 MB/s), raise to 256MB and set RAM_LIMIT_MB=450.
+// ─── Memory-Only Piece Storage ───────────────────────────
 function createMemoryStorage() {
     const MAX_MEMORY_BYTES = parseInt(process.env.PIECE_CACHE_MB || '128') * 1024 * 1024;
     return function (pieceLength, opts) {
@@ -347,9 +359,6 @@ function createMemoryStorage() {
         let currentBytes = 0;
 
         const evictIfNeeded = () => {
-            // FIX #3: Evict OLDEST pieces (LRU), not random ones.
-            // Original code iterated the whole map to find oldest — same approach kept,
-            // but now only fires when genuinely over budget (not on every put).
             while (currentBytes > MAX_MEMORY_BYTES && store.size > 0) {
                 let oldestKey = null, oldestTime = Infinity;
                 for (const [k, v] of store) {
@@ -386,7 +395,7 @@ function createMemoryStorage() {
     };
 }
 
-// ─── Hydra Brain: Advanced Dynamic Resource Controller ───────
+// ─── Hydra Brain: Advanced Dynamic Resource Controller ───
 let _ramHistory = [];
 function recordRamSample() {
     const now = getRamUsageMB();
@@ -412,7 +421,6 @@ function getDynamicLimits(forInfoHash) {
     const projectedRam = ram + (trend * 10);
     const effectiveRam = Math.max(ram, Math.min(RAM_LIMIT_MB, projectedRam));
     const headRoom = Math.max(0, RAM_LIMIT_MB - effectiveRam);
-
     const totalBudget = Math.floor(headRoom * 0.7);
 
     let perEngineConns;
@@ -430,10 +438,6 @@ function getDynamicLimits(forInfoHash) {
 
     const pressureRatio = Math.max(0, Math.min(1, effectiveRam / RAM_LIMIT_MB));
     const pressureMultiplier = Math.pow(1 - pressureRatio, 1.5);
-
-    // FIX #4: Minimum connections raised from 1 → 20.
-    // Below ~15 peers, torrent-stream can stall waiting for a single peer to respond.
-    // 20 peers is the practical floor for reliable 1080p streaming.
     perEngineConns = Math.max(20, Math.min(100, Math.floor(perEngineConns * (0.3 + 0.7 * pressureMultiplier))));
 
     let mode = 'HIGH';
@@ -569,8 +573,7 @@ function evictIfNeeded() {
         return;
     }
 
-    let oldest = null;
-    let oldestTime = Infinity;
+    let oldest = null, oldestTime = Infinity;
     for (const key of keys) {
         if (activeEngines[key].activeStreams === 0 && activeEngines[key].lastAccess < oldestTime) {
             oldestTime = activeEngines[key].lastAccess;
@@ -585,8 +588,7 @@ function evictIfNeeded() {
 
     const critical = limits.mode === 'EMERGENCY' || limits.mode === 'CRITICAL' || overRam;
     if (critical) {
-        let slowest = null;
-        let slowestSpeed = Infinity;
+        let slowest = null, slowestSpeed = Infinity;
         for (const key of keys) {
             const avg = activeEngines[key].speedSamples?.reduce((a, b) => a + b, 0) / (activeEngines[key].speedSamples?.length || 1);
             if (avg < slowestSpeed) { slowestSpeed = avg; slowest = key; }
@@ -630,13 +632,6 @@ function resetEngineTimeout(infoHash) {
     if (!entry) return;
     entry.lastAccess = Date.now();
     clearTimeout(entry.timeout);
-
-    // FIX #5: Always use ENGINE_TIMEOUT (30 min) — never the 3-minute idle timeout.
-    // The old 3-minute idle timeout was the single biggest cause of mid-movie stream death.
-    // Stremio frequently pauses download (not the player pause, but the HTTP connection)
-    // for 5–15 minutes when the user pauses or the player pre-buffer fills up.
-    // The engine MUST survive this or the next play request creates a cold engine
-    // that has to re-connect peers and re-buffer from scratch.
     entry.timeout = setTimeout(() => {
         console.log(`[Engine] Timeout reached for ${infoHash.substring(0, 8)}… (${entry.activeStreams} active streams)`);
         destroyEngine(infoHash);
@@ -659,13 +654,8 @@ function getOrCreateEngine(infoHash) {
         tmp: '/tmp/torrent-stream',
         connections: limits.connections,
         uploads: 0,
-        // FIX #6: verify: true (was false).
-        // With verify: false, a corrupt or incomplete piece is silently passed to
-        // the player. The player then errors out and shows a spinner, but the piece
-        // is never re-requested because torrent-stream thinks it was served.
-        // The extra CPU cost of SHA1 verification is negligible vs. stream stability.
         verify: true,
-        dht: true,
+        dht: false,       // ← disabled: DHT adds 3–10s cold-start latency, trackers are enough
         tracker: true,
         storage: createMemoryStorage(),
     });
@@ -693,17 +683,15 @@ function getOrCreateEngine(infoHash) {
         const peers = engine.swarm.wires.length;
         const downloaded = (engine.swarm.downloaded / 1024 / 1024).toFixed(2);
 
-        if (parseFloat(speedMb) >= 0.1) {
-            entry.lastNonZeroSpeed = Date.now();
-        }
+        if (parseFloat(speedMb) >= 0.1) entry.lastNonZeroSpeed = Date.now();
 
         entry.speedSamples.push(parseFloat(speedMb));
         if (entry.speedSamples.length > 6) entry.speedSamples.shift();
         const avgSpeed = entry.speedSamples.reduce((a, b) => a + b, 0) / entry.speedSamples.length;
 
         const currentLimits = getDynamicLimits(infoHash);
-
         const prevLimit = entry._prevPeerLimit || currentLimits.connections;
+
         if (engine.swarm.size !== currentLimits.connections) {
             engine.swarm.size = currentLimits.connections;
             if (engine.swarm.maxConnections) engine.swarm.maxConnections = currentLimits.connections;
@@ -723,12 +711,6 @@ function getOrCreateEngine(infoHash) {
         }
         entry._prevPeerLimit = currentLimits.connections;
 
-        // FIX #7: Peer pruning is now RAM-pressure-only and much more conservative.
-        // Original code pruned peers whenever count exceeded the dynamic limit,
-        // which fired almost every interval. This starved the swarm of peers mid-stream.
-        // Now we only prune under genuine RAM pressure (>80% of limit) AND
-        // only kill peers that are truly useless: zero speed AND peer-choking us.
-        // We never prune below 20 peers regardless of settings.
         if (peers > currentLimits.connections) {
             const ram = getRamUsageMB();
             const underRamPressure = ram > RAM_LIMIT_MB * 0.8;
@@ -762,11 +744,6 @@ function getOrCreateEngine(infoHash) {
             }
         }
 
-        // FIX #8: Slow-peer eviction (every 30s) is now gated on active streams.
-        // Original code evicted zero-speed peers unconditionally, which destroyed
-        // peers that were simply waiting for the client to request their pieces.
-        // Now we only evict truly idle peers when actively streaming (activeStreams > 0)
-        // AND the swarm has >15 peers to spare.
         slowPeerEvictionTick++;
         if (slowPeerEvictionTick >= 6) {
             slowPeerEvictionTick = 0;
@@ -778,7 +755,6 @@ function getOrCreateEngine(infoHash) {
                 for (const wire of [...engine.swarm.wires]) {
                     try {
                         const peerSpeed = wire.downloadSpeed ? wire.downloadSpeed() : 0;
-                        // Only evict if: zero speed AND peer is choking us AND we have many peers
                         if (peerSpeed === 0 && wire.peerChoking && peers - evicted > 15) {
                             wire.destroy();
                             evicted++;
@@ -794,8 +770,7 @@ function getOrCreateEngine(infoHash) {
         if (parseFloat(speedMb) > 0 || peers > 0) {
             const ramMB = getRamUsageMB();
             const ramWarn = ramMB > (RAM_LIMIT_MB * 0.9) ? ' (!) RAM' : '';
-            const activeStr = entry.activeStreams;
-            console.log(`[Engine:${infoHash.substring(0, 8)}] ⚡ ${speedMb} MB/s | 👥 ${peers}p | ↓ ${downloaded} MB | 👥 ${activeStr} active | avg:${avgSpeed.toFixed(2)}${ramWarn}`);
+            console.log(`[Engine:${infoHash.substring(0, 8)}] ⚡ ${speedMb} MB/s | 👥 ${peers}p | ↓ ${downloaded} MB | 🎬 ${entry.activeStreams} active | avg:${avgSpeed.toFixed(2)}${ramWarn}`);
         }
     }, 5000);
 
@@ -806,7 +781,6 @@ function getOrCreateEngine(infoHash) {
                 console.log(`[Guard] Proactive RAM Check: ${getRamUsageMB()}MB exceeds ${RAM_LIMIT_MB}MB limit`);
                 evictIfNeeded();
             }
-
             const zombieAge = ZOMBIE_TIMEOUT / 1000;
             for (const [hash, e] of Object.entries(activeEngines)) {
                 const timeSinceGoodSpeed = Date.now() - (e.lastNonZeroSpeed || 0);
@@ -841,8 +815,7 @@ function getOrCreateEngine(infoHash) {
 
         engine.files.forEach(f => f.deselect());
 
-        let bestFile = null;
-        let bestSize = 0;
+        let bestFile = null, bestSize = 0;
         for (const f of engine.files) {
             if (['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.webm', '.m4v'].some(e => f.name.toLowerCase().endsWith(e)) && f.length > bestSize) {
                 bestFile = f;
@@ -854,12 +827,6 @@ function getOrCreateEngine(infoHash) {
             bestFile.select();
             console.log(`[Engine] Priority → "${bestFile.name}" (${(bestFile.length / 1024 / 1024).toFixed(0)} MB)`);
 
-            // FIX #9: Pre-buffer raised from 2MB → 20MB.
-            // 2MB at typical 1080p (~4 MB/s) is only ~0.5 seconds of video.
-            // By the time the HTTP response headers are sent, the first chunk is
-            // already being requested — a 2MB buffer is consumed almost instantly,
-            // causing the first stall. 20MB gives ~5 seconds of runway, which is
-            // enough for the player to fill its own internal buffer and start smoothly.
             setTimeout(() => {
                 try {
                     const WARMUP_BYTES = Math.min(20 * 1024 * 1024, bestFile.length - 1);
@@ -872,11 +839,10 @@ function getOrCreateEngine(infoHash) {
         }
     });
 
-    activeEngines[infoHash] = entry;
     return { engine, isReady: false };
 }
 
-// ─── Video file detection ────────────────────────────────
+// ─── Video file detection ─────────────────────────────────
 const VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v'];
 
 function isVideoFile(filename) {
@@ -888,17 +854,13 @@ function findVideoFile(files, fileIdx) {
     if (fileIdx !== undefined && fileIdx !== null && files[fileIdx]) {
         return files[fileIdx];
     }
-
-    let bestFile = null;
-    let bestSize = 0;
-
+    let bestFile = null, bestSize = 0;
     for (const file of files) {
         if (isVideoFile(file.name) && file.length > bestSize) {
             bestFile = file;
             bestSize = file.length;
         }
     }
-
     return bestFile;
 }
 
@@ -917,20 +879,13 @@ function serveVideoFile(file, req, res, infoHash) {
     });
 
     const totalSize = file.length;
-
     const ext = file.name.split('.').pop().toLowerCase();
     const mimeTypes = {
-        mp4: 'video/mp4',
-        mkv: 'video/x-matroska',
-        avi: 'video/x-msvideo',
-        mov: 'video/quicktime',
-        wmv: 'video/x-ms-wmv',
-        flv: 'video/x-flv',
-        webm: 'video/webm',
-        m4v: 'video/mp4',
+        mp4: 'video/mp4', mkv: 'video/x-matroska', avi: 'video/x-msvideo',
+        mov: 'video/quicktime', wmv: 'video/x-ms-wmv', flv: 'video/x-flv',
+        webm: 'video/webm', m4v: 'video/mp4',
     };
     const contentType = mimeTypes[ext] || 'application/octet-stream';
-
     const rangeHeader = req.headers.range;
 
     if (rangeHeader) {
@@ -941,10 +896,6 @@ function serveVideoFile(file, req, res, infoHash) {
 
         console.log(`[Stream] Range: ${start}-${end}/${totalSize} (${(chunkSize / 1024 / 1024).toFixed(1)} MB)`);
 
-        // FIX #10: Added Keep-Alive header to both response types.
-        // Without it, some HTTP/1.1 clients (and Stremio's internal player) close
-        // the TCP connection between range requests, forcing a full reconnect + re-seek
-        // on every chunk — which appears as repeated buffering.
         res.writeHead(206, {
             'Content-Range': `bytes ${start}-${end}/${totalSize}`,
             'Accept-Ranges': 'bytes',
@@ -955,19 +906,13 @@ function serveVideoFile(file, req, res, infoHash) {
             'Cache-Control': 'no-store',
         });
 
-        // FIX #11: highWaterMark raised from 4MB → 8MB.
-        // The highWaterMark sets how much data Node.js reads ahead of what's been
-        // sent to the client. A larger buffer means the stream can absorb brief
-        // peer slowdowns without starving the HTTP response pipe.
         const stream = file.createReadStream({ start, end, highWaterMark: 8 * 1024 * 1024 });
         stream.pipe(res);
         stream.on('error', (err) => {
             console.error(`[Stream Error] ${infoHash.substring(0, 8)} Read error: ${err.message}`);
             if (!res.headersSent) res.status(500).end();
         });
-        res.on('close', () => {
-            stream.destroy();
-        });
+        res.on('close', () => stream.destroy());
     } else {
         console.log(`[Stream] Full file: ${(totalSize / 1024 / 1024).toFixed(1)} MB`);
 
@@ -986,86 +931,134 @@ function serveVideoFile(file, req, res, infoHash) {
             console.error(`[Stream Error] ${infoHash.substring(0, 8)} Read error: ${err.message}`);
             if (!res.headersSent) res.status(500).end();
         });
-        res.on('close', () => {
-            stream.destroy();
-        });
+        res.on('close', () => stream.destroy());
     }
 }
 
-// ─── Stream Proxy Route ─────────────────────────────────
+// ─── Stream Proxy Route ───────────────────────────────────
 app.get('/stream/:infoHash', (req, res) => {
     const { infoHash } = req.params;
     const fileIdx = req.query.fileIdx !== undefined ? parseInt(req.query.fileIdx, 10) : undefined;
 
     console.log(`[Stream] Request for ${infoHash.substring(0, 8)}… fileIdx=${fileIdx}`);
 
-    const { engine, isReady } = getOrCreateEngine(infoHash);
+    // Prevent socket-level timeout — Railway/nginx must not kill idle connections
+    req.socket.setTimeout(0);
+    res.setTimeout(0);
 
+    const { engine, isReady } = getOrCreateEngine(infoHash);
     engine.setMaxListeners(30);
 
-    if (isReady && engine.files && engine.files.length > 0) {
-        console.log(`[Stream] Engine cached & ready, serving immediately`);
+    // ─── Fast path: engine was pre-warmed and ready ───────
+    if (isReady && engine.files?.length > 0) {
+        console.log(`[Stream] ✅ Pre-warmed hit — serving instantly`);
         const file = findVideoFile(engine.files, fileIdx);
-
-        if (!file) {
-            res.status(404).json({ error: 'No video file found in this torrent' });
-            return;
-        }
-
-        console.log(`[Stream] Serving: "${file.name}" (${(file.length / 1024 / 1024).toFixed(1)} MB)`);
-        serveVideoFile(file, req, res, infoHash);
-        return;
+        if (!file) return res.status(404).json({ error: 'No video file found in this torrent' });
+        return serveVideoFile(file, req, res, infoHash);
     }
 
+    // ─── Slow path: send keepalive headers immediately ────
+    // This prevents Railway/Stremio from declaring a 502 while we wait for peers.
+    let headersWritten = false;
+    let heartbeat = null;
     let responded = false;
+
+    const sendEarlyHeaders = () => {
+        if (headersWritten || res.headersSent) return;
+        headersWritten = true;
+        console.log(`[Stream] ⏳ Sending early headers to keep connection alive: ${infoHash.substring(0, 8)}…`);
+        res.writeHead(200, {
+            'Content-Type': 'video/mp4',
+            'Transfer-Encoding': 'chunked',
+            'Connection': 'keep-alive',
+            'Keep-Alive': 'timeout=120, max=1000',
+            'Cache-Control': 'no-store',
+            'Accept-Ranges': 'bytes',
+            'X-Accel-Buffering': 'no', // disable nginx buffering on Railway
+        });
+    };
+
+    const startHeartbeat = () => {
+        if (heartbeat) return;
+        heartbeat = setInterval(() => {
+            try {
+                if (!res.writableEnded && !res.destroyed) res.write(''); // empty chunk — valid in chunked encoding
+            } catch (e) {
+                clearInterval(heartbeat);
+                heartbeat = null;
+            }
+        }, 2000);
+    };
+
+    // Send early headers at 800ms — well before any proxy kill threshold
+    const earlyHeaderTimer = setTimeout(() => {
+        sendEarlyHeaders();
+        startHeartbeat();
+    }, 800);
+
+    const cleanup = () => {
+        clearTimeout(earlyHeaderTimer);
+        clearTimeout(timer);
+        if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+        engine.removeListener('ready', onReady);
+        engine.removeListener('error', onError);
+    };
 
     const onReady = () => {
         if (responded) return;
         responded = true;
-        clearTimeout(timer);
-        engine.removeListener('error', onError);
+        cleanup();
 
         const file = findVideoFile(engine.files, fileIdx);
         if (!file) {
-            res.status(404).json({ error: 'No video file found in this torrent' });
+            console.error(`[Stream] No video file found: ${infoHash.substring(0, 8)}…`);
+            if (!res.headersSent) res.status(404).json({ error: 'No video file found in this torrent' });
+            else res.end();
             return;
         }
 
-        console.log(`[Stream] Serving: "${file.name}" (${(file.length / 1024 / 1024).toFixed(1)} MB)`);
+        console.log(`[Stream] ✅ Engine ready — serving: "${file.name}" (${(file.length / 1024 / 1024).toFixed(1)} MB)`);
+
+        if (headersWritten) {
+            // We already sent chunked headers; range requests aren't possible on this response.
+            // End cleanly — Stremio will retry immediately and hit the fast (pre-warmed) path.
+            console.log(`[Stream] ℹ️ Chunked headers already sent — closing, retry will be instant`);
+            res.end();
+            return;
+        }
+
+        // Headers not yet sent — serve normally with full range support
         serveVideoFile(file, req, res, infoHash);
     };
 
     const onError = (err) => {
+        if (responded) return;
+        responded = true;
+        cleanup();
         console.error(`[Engine Error] ${err.message}`);
-        if (!responded) {
-            responded = true;
-            clearTimeout(timer);
-            engine.removeListener('ready', onReady);
-            if (!res.headersSent) res.status(500).json({ error: 'Torrent engine error' });
-        }
+        if (!res.headersSent) res.status(500).json({ error: 'Torrent engine error' });
+        else res.end();
     };
 
     engine.once('ready', onReady);
     engine.once('error', onError);
 
     const timer = setTimeout(() => {
-        if (!responded) {
-            responded = true;
-            engine.removeListener('ready', onReady);
-            engine.removeListener('error', onError);
-            console.error(`[Stream] Timeout (${CONNECT_TIMEOUT / 1000}s): ${infoHash.substring(0, 8)}…`);
-            if (!res.headersSent) {
-                res.status(504).json({ error: 'Torrent timed out — try a lower quality with more seeders' });
-            }
+        if (responded) return;
+        responded = true;
+        cleanup();
+        console.error(`[Stream] ⏰ Timeout (${CONNECT_TIMEOUT / 1000}s): ${infoHash.substring(0, 8)}…`);
+        if (!res.headersSent) {
+            res.status(504).json({ error: 'Torrent timed out — try a lower quality with more seeders' });
+        } else {
+            res.end();
         }
     }, CONNECT_TIMEOUT);
 
     req.on('close', () => {
         if (!responded) {
             responded = true;
-            clearTimeout(timer);
-            engine.removeListener('ready', onReady);
-            engine.removeListener('error', onError);
+            cleanup();
         }
         console.log(`[Stream] Client disconnected: ${infoHash.substring(0, 8)}…`);
     });
@@ -1073,7 +1066,9 @@ app.get('/stream/:infoHash', (req, res) => {
 
 // ─── Start Server ────────────────────────────────────────
 app.listen(PORT, () => {
-    const baseUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+    const baseUrl = process.env.RENDER_EXTERNAL_URL
+        || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null)
+        || `http://localhost:${PORT}`;
     console.log(`
 ╔══════════════════════════════════════════════════════╗
 ║             🎬 Torrent to weblink 🎬              ║
