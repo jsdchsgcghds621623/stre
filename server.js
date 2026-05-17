@@ -991,34 +991,44 @@ app.get('/stream/:infoHash', (req, res) => {
         if (headersWritten || res.headersSent) return;
         headersWritten = true;
         console.log(`[Stream] ⏳ Sending early headers to keep connection alive: ${infoHash.substring(0, 8)}…`);
+        // Note: no Accept-Ranges here — chunked encoding and range requests are
+        // mutually exclusive. Accept-Ranges is set in serveVideoFile on the retry.
         res.writeHead(200, {
             'Content-Type': 'video/mp4',
             'Transfer-Encoding': 'chunked',
             'Connection': 'keep-alive',
             'Keep-Alive': 'timeout=120, max=1000',
             'Cache-Control': 'no-store',
-            'Accept-Ranges': 'bytes',
-            'X-Accel-Buffering': 'no', // disable nginx buffering on Railway
+            'X-Accel-Buffering': 'no',
         });
     };
 
     const startHeartbeat = () => {
         if (heartbeat) return;
+        // res.write('') is a Node.js no-op — it sends zero bytes and Railway
+        // sees silence, triggering its idle-connection 502 kill.
+        // We must write REAL bytes. A single null byte (0x00) is invisible to
+        // video players (it lands before any media headers are parsed) but keeps
+        // the TCP connection alive from Railway's perspective.
+        // We write it every 3s — well inside any proxy idle timeout.
         heartbeat = setInterval(() => {
             try {
-                if (!res.writableEnded && !res.destroyed) res.write(''); // empty chunk — valid in chunked encoding
+                if (!res.writableEnded && !res.destroyed) {
+                    res.write(Buffer.from([0x00])); // 1 real byte — keeps Railway alive
+                }
             } catch (e) {
                 clearInterval(heartbeat);
                 heartbeat = null;
             }
-        }, 2000);
+        }, 3000);
     };
 
-    // Send early headers at 800ms — well before any proxy kill threshold
+    // Send early headers at 500ms — faster than before, Railway's idle kill
+    // can fire in as little as 2s on cold connections
     const earlyHeaderTimer = setTimeout(() => {
         sendEarlyHeaders();
         startHeartbeat();
-    }, 800);
+    }, 500);
 
     const cleanup = () => {
         clearTimeout(earlyHeaderTimer);
