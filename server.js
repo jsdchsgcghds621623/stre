@@ -1,1168 +1,360 @@
-const express = require('express');
-const cors = require('cors');
-const torrentStream = require('torrent-stream');
-const addonInterface = require('./addon');
-const { getRouter } = require('stremio-addon-sdk');
-const { spawn } = require('child_process');
+import http from 'http';
+import https from 'https';
+import url from 'url';
+import fs from 'fs';
+import path from 'path';
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = 5001;
+const API_TOKEN = '82f9520d915e75bbe1df1c93'; // StreamP2P API token
+const API_BASE = 'https://streamp2p.com/api/v1/video/manage';
 
-// ─── CORS ────────────────────────────────────────────────
-app.use(cors());
+// Store likes in memory
+const likesFile = path.join(process.cwd(), 'likes.json');
+const campaignSubmissionsFile = path.join(process.cwd(), 'campaign-submissions.json');
+const campaignUploadsDir = path.join(process.cwd(), 'campaign-uploads');
+let likeCounts = {};
+let campaignSubmissions = [];
 
-// ─── Static Files ────────────────────────────────────────
-app.use(express.static('public'));
-
-// ─── Torrent Engine Management ───────────────────────────
-const RAM_LIMIT_MB = parseInt(process.env.RAM_LIMIT_MB) || 300;
-const DISK_LIMIT_MB = parseInt(process.env.DISK_LIMIT_MB) || 300;
-const ENGINE_TIMEOUT = 30 * 60 * 1000;
-const CONNECT_TIMEOUT = 75000; // 75s — Railway kills at ~100s, we bail first
-const ZOMBIE_TIMEOUT = 2 * 60 * 1000;
-const activeEngines = {};
-
-// ─── Wire up pre-warm callback from addon ────────────────
-if (addonInterface.setWarmEngineCallback) {
-    addonInterface.setWarmEngineCallback((hash) => {
-        if (!activeEngines[hash]) {
-            console.log(`[Warm] Pre-warming engine: ${hash.substring(0, 8)}…`);
-            setImmediate(() => getOrCreateEngine(hash));
-        }
-    });
+// Load existing likes
+if (fs.existsSync(likesFile)) {
+  try {
+    likeCounts = JSON.parse(fs.readFileSync(likesFile, 'utf8'));
+  } catch (err) {
+    console.error('❌ Failed to load likes.json:', err.message);
+    likeCounts = {};
+  }
 }
 
-// ─── Health check ────────────────────────────────────────
-app.get('/health', (_req, res) => {
-    res.json({
-        status: 'ok',
-        version: '3.5.41',
-        dashboard: `https://${_req.get('host')}/dashboard`,
-        activeEngines: Object.keys(activeEngines).length,
-        maxEngines: 'Unlimited',
-        ramUsageMB: getRamUsageMB(),
-        ramTrendMBs: getRamTrend().toFixed(2),
-        dynamicMode: getDynamicLimits().mode,
-        activePeerBudget: getDynamicLimits().connections,
-        ramLimitMB: RAM_LIMIT_MB,
-        uptime: process.uptime(),
-    });
-});
-
-// ─── Self-ping to prevent Railway sleep ──────────────────
-const axios = require('axios');
-const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
-    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/health`
-    : process.env.RENDER_EXTERNAL_URL
-        ? `${process.env.RENDER_EXTERNAL_URL}/health`
-        : null;
-
-if (SELF_URL) {
-    setInterval(async () => {
-        try { await axios.get(SELF_URL, { timeout: 5000 }); }
-        catch (e) { /* ignore */ }
-    }, 4 * 60 * 1000);
+if (fs.existsSync(campaignSubmissionsFile)) {
+  try {
+    campaignSubmissions = JSON.parse(fs.readFileSync(campaignSubmissionsFile, 'utf8'));
+  } catch (err) {
+    console.error('❌ Failed to load campaign-submissions.json:', err.message);
+    campaignSubmissions = [];
+  }
 }
 
-// ─── Debug: test API connectivity ────────────────────────
-app.get('/debug', async (_req, res) => {
-    const results = {};
-    for (const mirror of ['https://yts.torrentbay.st', 'https://movies-api.accel.li']) {
-        try {
-            const url = `${mirror}/api/v2/movie_details.json?imdb_id=tt1375666`;
-            const r = await axios.get(url, { timeout: 10000 });
-            const torrents = r.data?.data?.movie?.torrents?.length || 0;
-            results[mirror] = { status: 'ok', torrents };
-        } catch (err) {
-            results[mirror] = { status: 'error', message: err.message, code: err.response?.status };
-        }
-    }
-    try {
-        const url = 'https://eztvx.to/api/get-torrents?imdb_id=0944947&limit=5';
-        const r = await axios.get(url, { timeout: 10000 });
-        results['eztv'] = { status: 'ok', torrents: r.data?.torrents?.length || 0 };
-    } catch (err) {
-        results['eztv'] = { status: 'error', message: err.message, code: err.response?.status };
-    }
-    try {
-        const url = 'https://apibay.org/q.php?q=test&cat=0';
-        const r = await axios.get(url, { timeout: 10000 });
-        results['tpb'] = { status: 'ok', count: r.data?.length || 0 };
-    } catch (err) {
-        results['tpb'] = { status: 'error', message: err.message, code: err.response?.status };
-    }
-    res.json({ version: '3.5.41', results });
-});
-
-// ─── Dashboard ───────────────────────────────────────────
-app.get('/dashboard', (req, res) => {
-    const engines = Object.entries(activeEngines).map(([hash, entry]) => ({
-        id: hash.substring(0, 8),
-        ready: entry.isReady,
-        activeStreams: entry.activeStreams || 0,
-        speed: (entry.engine.swarm.downloadSpeed() / 1024 / 1024).toFixed(2) + ' MB/s',
-        peers: entry.engine.swarm.wires.length,
-        downloaded: (entry.engine.swarm.downloaded / 1024 / 1024).toFixed(2) + ' MB',
-        lastAccess: new Date(entry.lastAccess).toLocaleTimeString(),
-        files: entry.engine.files?.length || 0
-    }));
-
-    const limits = getDynamicLimits();
-    res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Live Monitor</title>
-        <style>
-            body { background: #121212; color: #fff; font-family: sans-serif; padding: 20px; }
-            .card { background: #1e1e1e; padding: 20px; border-radius: 10px; margin-bottom: 15px; border: 1px solid #333; }
-            .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px; }
-            .stat { color: #8b5cf6; font-weight: bold; }
-            h1 { color: #8b5cf6; margin-bottom: 5px; }
-            .mode-badge { display: inline-block; padding: 4px 10px; border-radius: 5px; font-size: 0.8rem; font-weight: bold; margin-left: 10px; background: #8b5cf6; color: #fff; vertical-align: middle; }
-            .refresh { font-size: 0.8rem; color: #666; margin-bottom: 20px; }
-        </style>
-        <meta http-equiv="refresh" content="5">
-    </head>
-    <body>
-        <h1>📊 Live Stream Monitor <span class="mode-badge">${limits.mode} MODE</span></h1>
-        <div class="refresh">Auto-refreshing every 5 seconds. Active Engines: ${engines.length} / Unlimited (RAM Limit: ${RAM_LIMIT_MB}MB)</div>
-        <div class="grid">
-            ${engines.length ? engines.map(e => `
-                <div class="card">
-                    <div><b>Engine ID:</b> ${e.id}</div>
-                    <div><b>Status:</b> ${e.ready ? '✅ Ready' : '⏳ Connecting'}</div>
-                    <div><b>Active Streams:</b> <span class="stat">${e.activeStreams}</span></div>
-                    <div><b>Speed:</b> <span class="stat">${e.speed}</span></div>
-                    <div><b>Peers:</b> ${e.peers}</div>
-                    <div><b>Downloaded:</b> ${e.downloaded}</div>
-                    <div><b>Files:</b> ${e.files}</div>
-                    <div><b>Last Activity:</b> ${e.lastAccess}</div>
-                </div>
-            `).join('') : '<div class="card">No active streams. Start watching something in Stremio!</div>'}
-        </div>
-        <div style="margin-top: 30px;"><a href="/" style="color: #666; font-size: 0.9rem;">← Back to Landing Page</a></div>
-    </body>
-    </html>
-    `);
-});
-
-// ─── Landing Page ────────────────────────────────────────
-app.get('/', (req, res) => {
-    const host = req.get('host') || 'stremio.eletroclay.com';
-    const installUrl = `stremio://${host}/manifest.json`;
-
-    res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Torrent to weblink | Stremio Addon</title>
-        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
-        <style>
-            * { box-sizing: border-box; margin: 0; padding: 0; }
-            body {
-                font-family: 'Outfit', sans-serif;
-                background: radial-gradient(circle at 50% 0%, #1a1a2e 0%, #0d0d17 100%);
-                color: #e2e8f0;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                min-height: 100vh;
-                text-align: center;
-                overflow: hidden;
-            }
-            .glow {
-                position: absolute;
-                width: 600px;
-                height: 600px;
-                background: radial-gradient(circle, rgba(139, 92, 246, 0.15) 0%, transparent 70%);
-                top: -200px;
-                border-radius: 50%;
-                z-index: 0;
-                animation: pulse 8s ease-in-out infinite alternate;
-            }
-            @keyframes pulse {
-                0% { transform: scale(1); opacity: 0.8; }
-                100% { transform: scale(1.1); opacity: 1; }
-            }
-            .container {
-                position: relative;
-                z-index: 1;
-                max-width: 700px;
-                padding: 50px 40px;
-                background: rgba(255, 255, 255, 0.03);
-                border-radius: 24px;
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                backdrop-filter: blur(16px);
-                -webkit-backdrop-filter: blur(16px);
-                box-shadow: 0 30px 60px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.1);
-                animation: floatUp 1s ease-out forwards;
-            }
-            @keyframes floatUp {
-                from { transform: translateY(40px); opacity: 0; }
-                to { transform: translateY(0); opacity: 1; }
-            }
-            h1 {
-                font-size: 3.5rem;
-                font-weight: 800;
-                margin-bottom: 15px;
-                background: linear-gradient(135deg, #a78bfa 0%, #ec4899 100%);
-                -webkit-background-clip: text;
-                -webkit-text-fill-color: transparent;
-                letter-spacing: -1px;
-            }
-            p.subtitle {
-                font-size: 1.25rem;
-                line-height: 1.6;
-                color: #94a3b8;
-                margin-bottom: 40px;
-                font-weight: 300;
-            }
-            .btn {
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                gap: 10px;
-                background: linear-gradient(135deg, #8b5cf6 0%, #6d28d9 100%);
-                color: white;
-                text-decoration: none;
-                padding: 16px 48px;
-                font-size: 1.25rem;
-                font-weight: 600;
-                border-radius: 50px;
-                transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-                box-shadow: 0 10px 25px rgba(139, 92, 246, 0.5);
-                position: relative;
-                overflow: hidden;
-            }
-            .btn::after {
-                content: '';
-                position: absolute;
-                top: 0; left: -100%; width: 50%; height: 100%;
-                background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
-                transform: skewX(-20deg);
-                transition: 0.5s;
-            }
-            .btn:hover::after { left: 150%; }
-            .btn:hover {
-                transform: translateY(-3px) scale(1.02);
-                box-shadow: 0 15px 35px rgba(139, 92, 246, 0.6);
-            }
-            .btn-links {
-                margin-top: 25px;
-                display: flex;
-                gap: 20px;
-                justify-content: center;
-            }
-            .link {
-                color: #8b5cf6;
-                text-decoration: none;
-                font-weight: 600;
-                font-size: 1rem;
-                transition: color 0.2s;
-            }
-            .link:hover { color: #a78bfa; }
-            .features {
-                display: flex;
-                flex-wrap: wrap;
-                justify-content: center;
-                gap: 15px;
-                margin-top: 40px;
-            }
-            .feature {
-                background: rgba(139, 92, 246, 0.1);
-                padding: 12px 24px;
-                border-radius: 12px;
-                font-size: 0.95rem;
-                font-weight: 600;
-                color: #e2e8f0;
-                border: 1px solid rgba(139, 92, 246, 0.2);
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                transition: transform 0.2s, background 0.2s;
-            }
-            .feature:hover {
-                transform: translateY(-2px);
-                background: rgba(139, 92, 246, 0.2);
-            }
-        </style>
-    </head>
-    <body>
-        <div class="glow"></div>
-        <div class="container">
-            <h1>Torrent to weblink</h1>
-            <p class="subtitle">
-                The ultimate Stremio addon powered by the <b>Hydra Brain</b> engine. Experience flawless, buffer-free 4K & HDR streaming with an intelligent cloud proxy that guarantees 100% uptime.
-            </p>
-            <a href="${installUrl}" class="btn">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg>
-                Install in Stremio
-            </a>
-            <div class="btn-links">
-                <a href="/dashboard" class="link">📊 Live Monitor</a>
-                <a href="https://github.com/Aswinajay/stremio-addon" target="_blank" class="link">⭐ GitHub</a>
-                <a href="https://www.buymeacoffee.com/withaswin" target="_blank" class="link">☕ Support Me</a>
-            </div>
-            <div class="features">
-                <div class="feature">⚡ Cloud Proxy</div>
-                <div class="feature">🧠 Hydra Brain Protection</div>
-                <div class="feature">🎬 40+ Aggregated Sources</div>
-                <div class="feature">🔄 MKV→MP4 Remux</div>
-            </div>
-        </div>
-    </body>
-    </html>
-    `);
-});
-
-// ─── Stremio Addon SDK routes ────────────────────────────
-const addonRouter = getRouter(addonInterface);
-app.use(addonRouter);
-
-// ─── /tmp Disk Guard ─────────────────────────────────────
-const { execSync } = require('child_process');
-function getTmpDiskMB() {
-    try {
-        const out = execSync('du -sm /tmp/torrent-stream 2>/dev/null || echo 0').toString().trim();
-        return parseInt(out.split('\t')[0]) || 0;
-    } catch (e) { return 0; }
-}
-function purgeTmpIfNeeded() {
-    const diskMB = getTmpDiskMB();
-    if (diskMB < DISK_LIMIT_MB) return;
-    console.log(`[DiskGuard] 💾 /tmp disk usage: ${diskMB}MB exceeds ${DISK_LIMIT_MB}MB limit — purging stale cache...`);
-    try {
-        const cacheDir = '/tmp/torrent-stream/torrent-stream';
-        const fs = require('fs');
-        if (!fs.existsSync(cacheDir)) return;
-        const hashes = fs.readdirSync(cacheDir);
-        const activeHashes = new Set(Object.keys(activeEngines));
-        for (const hash of hashes) {
-            if (!activeHashes.has(hash)) {
-                try {
-                    execSync(`rm -rf "${cacheDir}/${hash}"`);
-                    console.log(`[DiskGuard] 🗑️ Purged stale cache: ${hash.substring(0, 8)}…`);
-                } catch (e) { /* ignore */ }
-            }
-        }
-    } catch (e) { /* ignore */ }
-}
-setInterval(purgeTmpIfNeeded, 60 * 1000);
-
-// ─── Memory-Only Piece Storage ───────────────────────────
-function createMemoryStorage() {
-    const MAX_MEMORY_BYTES = parseInt(process.env.PIECE_CACHE_MB || '128') * 1024 * 1024;
-    return function (pieceLength, opts) {
-        const store = new Map();
-        let currentBytes = 0;
-
-        const evictIfNeeded = () => {
-            while (currentBytes > MAX_MEMORY_BYTES && store.size > 0) {
-                let oldestKey = null, oldestTime = Infinity;
-                for (const [k, v] of store) {
-                    if (v.t < oldestTime) { oldestKey = k; oldestTime = v.t; }
-                }
-                if (oldestKey !== null) {
-                    currentBytes -= store.get(oldestKey).buf.length;
-                    store.delete(oldestKey);
-                } else break;
-            }
-        };
-
-        return {
-            get(index, opts2, cb) {
-                if (typeof opts2 === 'function') { cb = opts2; opts2 = {}; }
-                const entry = store.get(index);
-                if (!entry) return cb(new Error('piece not in memory'));
-                entry.t = Date.now();
-                const buf = entry.buf;
-                const offset = (opts2 && opts2.offset) || 0;
-                const length = (opts2 && opts2.length != null) ? opts2.length : buf.length - offset;
-                cb(null, buf.slice(offset, offset + length));
-            },
-            put(index, buf, cb) {
-                if (store.has(index)) currentBytes -= store.get(index).buf.length;
-                store.set(index, { buf, t: Date.now() });
-                currentBytes += buf.length;
-                evictIfNeeded();
-                if (cb) cb(null);
-            },
-            close(cb) { store.clear(); currentBytes = 0; if (cb) cb(null); },
-            destroy(cb) { store.clear(); currentBytes = 0; if (cb) cb(null); }
-        };
-    };
+if (!fs.existsSync(campaignUploadsDir)) {
+  fs.mkdirSync(campaignUploadsDir, { recursive: true });
 }
 
-// ─── Hydra Brain: Advanced Dynamic Resource Controller ───
-let _ramHistory = [];
-function recordRamSample() {
-    const now = getRamUsageMB();
-    _ramHistory.push({ t: Date.now(), v: now });
-    if (_ramHistory.length > 6) _ramHistory.shift();
-}
-function getRamTrend() {
-    if (_ramHistory.length < 2) return 0;
-    const oldest = _ramHistory[0];
-    const newest = _ramHistory[_ramHistory.length - 1];
-    const dtSec = (newest.t - oldest.t) / 1000;
-    if (dtSec === 0) return 0;
-    return (newest.v - oldest.v) / dtSec;
+// Save likes to file
+function saveLikes() {
+  fs.writeFileSync(likesFile, JSON.stringify(likeCounts), 'utf8');
 }
 
-function getDynamicLimits(forInfoHash) {
-    recordRamSample();
-    const ram = getRamUsageMB();
-    const trend = getRamTrend();
-    const engines = Object.values(activeEngines);
-    const numEngines = engines.length || 1;
+function saveCampaignSubmissions() {
+  fs.writeFileSync(campaignSubmissionsFile, JSON.stringify(campaignSubmissions, null, 2), 'utf8');
+}
 
-    const projectedRam = ram + (trend * 10);
-    const effectiveRam = Math.max(ram, Math.min(RAM_LIMIT_MB, projectedRam));
-    const headRoom = Math.max(0, RAM_LIMIT_MB - effectiveRam);
-    const totalBudget = Math.floor(headRoom * 0.7);
+function generateSubmissionId() {
+  const date = new Date();
+  const datePart = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
+  const randomPart = Math.random().toString(36).slice(2, 8).toUpperCase();
+  return `MF-${datePart}-${randomPart}`;
+}
 
-    let perEngineConns;
-    if (forInfoHash && activeEngines[forInfoHash]) {
-        const me = activeEngines[forInfoHash];
-        const myWeight = me.activeStreams > 0 ? (1 + Math.min(3, (me.speedSamples?.slice(-1)[0] || 0))) : 0.1;
-        const totalWeight = engines.reduce((sum, e) => {
-            return sum + (e.activeStreams > 0 ? (1 + Math.min(3, (e.speedSamples?.slice(-1)[0] || 0))) : 0.1);
-        }, 0);
-        const myShare = totalWeight > 0 ? myWeight / totalWeight : 1 / numEngines;
-        perEngineConns = Math.floor(totalBudget * myShare);
-    } else {
-        perEngineConns = Math.floor(totalBudget / numEngines);
-    }
+function decodeBase64Image(dataUrl) {
+  const match = dataUrl.match(/^data:(image\/(png|jpeg|jpg|webp));base64,(.+)$/i);
+  if (!match) return null;
+  return {
+    mimeType: match[1].toLowerCase(),
+    extension: match[2].toLowerCase() === 'jpeg' ? 'jpg' : match[2].toLowerCase(),
+    buffer: Buffer.from(match[3], 'base64'),
+  };
+}
 
-    const pressureRatio = Math.max(0, Math.min(1, effectiveRam / RAM_LIMIT_MB));
-    const pressureMultiplier = Math.pow(1 - pressureRatio, 1.5);
-    perEngineConns = Math.max(20, Math.min(100, Math.floor(perEngineConns * (0.3 + 0.7 * pressureMultiplier))));
+// Handle like request
+function handleLikeRequest(req, res, movieId) {
+  if (!movieId) {
+    res.writeHead(400, corsHeaders);
+    res.end(JSON.stringify({ error: 'Missing movieId' }));
+    return;
+  }
 
-    let mode = 'HIGH';
-    if (effectiveRam > 195) mode = 'EMERGENCY';
-    else if (effectiveRam > 185) mode = 'CRITICAL';
-    else if (effectiveRam > 170) mode = 'SEVERE';
-    else if (effectiveRam > 150) mode = 'LOW';
-    else if (effectiveRam > 120) mode = 'MEDIUM';
-    else if (effectiveRam > 100) mode = 'BALANCED';
+  likeCounts[movieId] = (likeCounts[movieId] || 0) + 1;
+  saveLikes();
 
-    const trendStr = trend >= 0 ? `+${trend.toFixed(1)}` : trend.toFixed(1);
+  res.writeHead(200, corsHeaders);
+  res.end(JSON.stringify({ movieId, likes: likeCounts[movieId] }));
+}
+
+// Handle get likes request
+function handleGetLikes(req, res, movieId) {
+  if (!movieId) {
+    res.writeHead(400, corsHeaders);
+    res.end(JSON.stringify({ error: 'Missing movieId' }));
+    return;
+  }
+
+  res.writeHead(200, corsHeaders);
+  res.end(JSON.stringify({ movieId, likes: likeCounts[movieId] || 0 }));
+}
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Content-Type': 'application/json'
+};
+
+const normalize = (str) => str?.toLowerCase().replace(/[^a-z0-9]/g, '') || '';
+
+const extractSeasonEpisode = (name = '') => {
+  const match = name.toLowerCase().match(/s(\d{1,2})[.\- ]?e(\d{1,2})/);
+  if (match) {
     return {
-        connections: perEngineConns,
-        mode,
-        label: `${mode} | 🧠${ram}MB ${trendStr}MB/s | ${perEngineConns}c`,
-        ram,
-        trend,
+      season: match[1].padStart(2, '0'),
+      episode: match[2].padStart(2, '0'),
     };
-}
+  }
+  return { season: null, episode: null };
+};
 
-function getRamUsageMB() {
-    return Math.round(process.memoryUsage().rss / 1024 / 1024);
-}
+const parseSlugParts = (slug = '') => {
+  const parts = slug.toLowerCase().split('/');
+  const title = parts[0]?.replace(/-/g, ' ') || '';
 
-function getTrackers() {
-    return [
-        'udp://tracker.opentrackr.org:1337/announce',
-        'http://tracker.opentrackr.org:1337/announce',
-        'udp://open.demonii.com:1337/announce',
-        'udp://tracker.torrent.eu.org:451/announce',
-        'udp://www.torrent.eu.org:451/announce',
-        'udp://open.stealth.si:80/announce',
-        'udp://exodus.desync.com:6969/announce',
-        'udp://tracker.openbittorrent.com:6969/announce',
-        'http://tracker.openbittorrent.com:80/announce',
-        'udp://9.rarbg.com:2810/announce',
-        'udp://bt1.archive.org:6969/announce',
-        'udp://bt2.archive.org:6969/announce',
-        'https://torrent.tracker.durukanbal.com:443/announce',
-        'https://cny.fan:443/announce',
-        'udp://utracker.ghostchu-services.top:6969/announce',
-        'udp://udp.tracker.projectk.org:23333/announce',
-        'udp://tracker1.myporn.club:9337/announce',
-        'udp://tracker.tvunderground.org.ru:3218/announce',
-        'udp://tracker.tryhackx.org:6969/announce',
-        'udp://tracker.torrust-demo.com:6969/announce',
-        'udp://tracker.theoks.net:6969/announce',
-        'udp://tracker.t-1.org:6969/announce',
-        'udp://tracker.srv00.com:6969/announce',
-        'udp://tracker.qu.ax:6969/announce',
-        'udp://tracker.playground.ru:6969/announce',
-        'udp://tracker.opentorrent.top:6969/announce',
-        'udp://tracker.ixuexi.click:6969/announce',
-        'udp://tracker.gmi.gd:6969/announce',
-        'udp://tracker.fnix.net:6969/announce',
-        'udp://tracker.filemail.com:6969/announce',
-        'udp://tracker.dler.org:6969/announce',
-        'udp://tracker.corpscorp.online:80/announce',
-        'udp://tracker.bluefrog.pw:2710/announce',
-        'udp://tracker.bittor.pw:1337/announce',
-        'udp://tracker.alaskantf.com:6969/announce',
-        'udp://tracker.1h.is:1337/announce',
-        'udp://tracker-udp.gbitt.info:80/announce',
-        'udp://tr4ck3r.duckdns.org:6969/announce',
-        'udp://retracker.lanta.me:2710/announce',
-        'udp://opentracker.io:6969/announce',
-        'udp://open.dstud.io:6969/announce',
-        'udp://leet-tracker.moe:1337/announce',
-        'udp://explodie.org:6969/announce',
-        'udp://evan.im:6969/announce',
-        'udp://bittorrent-tracker.e-n-c-r-y-p-t.net:1337/announce',
-        'udp://bandito.byterunner.io:6969/announce',
-        'udp://tracker.zupix.online:6969/announce',
-        'udp://tracker.therarbg.to:6969/announce',
-        'udp://tracker.flatuslifir.is:6969/announce',
-        'udp://tracker.ducks.party:1984/announce',
-        'udp://tracker.ddunlimited.net:6969/announce',
-        'udp://torrentclub.online:54123/announce',
-        'udp://open.demonoid.ch:6969/announce',
-        'udp://ipv4announce.sktorrent.eu:6969/announce',
-        'udp://tracker.moeking.me:6969/announce',
-        'udp://tracker.publictracker.xyz:6969/announce',
-        'udp://tracker.tiny-vps.com:6969/announce',
-        'udp://tracker.cyberia.is:6969/announce',
-        'udp://tracker.birkenwald.de:6969/announce',
-        'udp://tracker.auctor.tv:6969/announce',
-        'udp://tracker.bitsearch.to:1337/announce',
-        'udp://tracker.bt4g.com:2095/announce',
-        'udp://tracker.monitorit4.me:6969/announce',
-        'udp://tracker.army:6969/announce',
-        'udp://tracker.ds.is:6969/announce',
-        'udp://tracker.kicks-ass.net:80/announce',
-        'udp://tracker.irxh.net:1337/announce',
-        'udp://tracker.internetwarriors.net:1337/announce',
-        'https://tracker.zhuqiy.com:443/announce',
-        'https://tracker.tamersunion.org:443/announce',
-        'https://tracker.nanoha.org:443/announce',
-        'https://tracker.lilithraws.org:443/announce',
-        'https://tr.hostux.net:443/announce',
-        'https://tracker.gbitt.info:443/announce',
-        'https://tracker.loligirl.cn:443/announce',
-        'https://tracker.imgoingto.icu:443/announce',
-        'https://t.zerg.pw:443/announce',
-        'https://tracker.renfei.net:443/announce',
-        'http://t.overflow.biz:6969/announce',
-    ];
-}
+  const seasonMatch = slug.match(/season-?(\d+)/i);
+  const episodeMatch = slug.match(/episode-?(\d+)/i);
 
-function buildMagnet(infoHash) {
-    const trackers = getTrackers();
-    const trackerParams = trackers.map(t => `&tr=${encodeURIComponent(t)}`).join('');
-    return `magnet:?xt=urn:btih:${infoHash}${trackerParams}`;
-}
+  const season = seasonMatch ? seasonMatch[1].padStart(2, '0') : null;
+  const episode = episodeMatch ? episodeMatch[1].padStart(2, '0') : null;
 
-function evictIfNeeded() {
-    const keys = Object.keys(activeEngines);
-    const limits = getDynamicLimits();
-    const ramMB = getRamUsageMB();
-    const overRam = ramMB > RAM_LIMIT_MB;
+  return { title, season, episode };
+};
 
-    if (!overRam) return;
+const server = http.createServer((req, res) => {
+  console.log(`🔵 Request: [${req.method}] ${req.url}`);
 
-    const reason = `RAM ${ramMB}MB > ${RAM_LIMIT_MB}MB limit`;
-    console.log(`[Engine] Eviction triggered: ${reason}`);
-
-    const zombie = keys.find(k => {
-        const e = activeEngines[k];
-        return e.activeStreams === 0 && e.lastNonZeroSpeed && (Date.now() - e.lastNonZeroSpeed > ZOMBIE_TIMEOUT);
-    });
-    if (zombie) {
-        console.log(`[Engine] Evicting ZOMBIE: ${zombie.substring(0, 8)}…`);
-        destroyEngine(zombie);
-        return;
-    }
-
-    let oldest = null, oldestTime = Infinity;
-    for (const key of keys) {
-        if (activeEngines[key].activeStreams === 0 && activeEngines[key].lastAccess < oldestTime) {
-            oldestTime = activeEngines[key].lastAccess;
-            oldest = key;
-        }
-    }
-    if (oldest) {
-        console.log(`[Engine] Evicting oldest idle engine: ${oldest.substring(0, 8)}…`);
-        destroyEngine(oldest);
-        return;
-    }
-
-    const critical = limits.mode === 'EMERGENCY' || limits.mode === 'CRITICAL' || overRam;
-    if (critical) {
-        let slowest = null, slowestSpeed = Infinity;
-        for (const key of keys) {
-            const avg = activeEngines[key].speedSamples?.reduce((a, b) => a + b, 0) / (activeEngines[key].speedSamples?.length || 1);
-            if (avg < slowestSpeed) { slowestSpeed = avg; slowest = key; }
-        }
-        if (slowest) {
-            console.log(`[Engine] 🚨 FORCED EVICTION (${limits.mode}): ${slowest.substring(0, 8)}… (avg ${slowestSpeed.toFixed(2)} MB/s)`);
-            destroyEngine(slowest, true);
-        }
-    }
-}
-
-function destroyEngine(infoHash, force = false) {
-    const entry = activeEngines[infoHash];
-    if (!entry) return;
-
-    if (entry.activeStreams > 0 && !force) {
-        console.log(`[Engine] Postponing destruction for ${infoHash.substring(0, 8)}: ${entry.activeStreams} active streams`);
-        resetEngineTimeout(infoHash);
-        return;
-    }
-
-    clearTimeout(entry.timeout);
-    if (entry.logInterval) clearInterval(entry.logInterval);
-    delete activeEngines[infoHash];
-    console.log(`[Engine] Destroying: ${infoHash.substring(0, 8)}… (active: ${Object.keys(activeEngines).length})`);
-
-    try {
-        entry.engine.remove(false, (err) => {
-            if (err) {
-                try { entry.engine.destroy(); } catch (e) { /* ignore */ }
-            }
-            console.log(`[Engine] ✨ Resources flushed: ${infoHash.substring(0, 8)}…`);
-        });
-    } catch (e) {
-        try { entry.engine.destroy(); } catch (e2) { /* ignore */ }
-    }
-}
-
-function resetEngineTimeout(infoHash) {
-    const entry = activeEngines[infoHash];
-    if (!entry) return;
-    entry.lastAccess = Date.now();
-    clearTimeout(entry.timeout);
-    entry.timeout = setTimeout(() => {
-        console.log(`[Engine] Timeout reached for ${infoHash.substring(0, 8)}… (${entry.activeStreams} active streams)`);
-        destroyEngine(infoHash);
-    }, ENGINE_TIMEOUT);
-}
-
-function getOrCreateEngine(infoHash) {
-    if (activeEngines[infoHash]) {
-        resetEngineTimeout(infoHash);
-        return { engine: activeEngines[infoHash].engine, isReady: activeEngines[infoHash].isReady };
-    }
-
-    evictIfNeeded();
-
-    const limits = getDynamicLimits(infoHash);
-    const magnet = buildMagnet(infoHash);
-    console.log(`[Engine] Creating new engine (${limits.label || limits.mode}, ${limits.connections}c): ${infoHash.substring(0, 8)}…`);
-
-    const engine = torrentStream(magnet, {
-        tmp: '/tmp/torrent-stream',
-        connections: limits.connections,
-        uploads: 0,
-        verify: true,
-        dht: false,
-        tracker: true,
-        storage: createMemoryStorage(),
-    });
-
-    const entry = {
-        engine,
-        isReady: false,
-        activeStreams: 0,
-        lastAccess: Date.now(),
-        createdAt: Date.now(),
-    };
-
-    activeEngines[infoHash] = entry;
-    resetEngineTimeout(infoHash);
-
-    // ─── Dynamic Speed Manager ───────────────────────────
-    entry.lastNonZeroSpeed = Date.now();
-    entry.speedSamples = [];
-    let slowPeerEvictionTick = 0;
-
-    entry.logInterval = setInterval(() => {
-        if (!engine.swarm) return;
-        const speedBps = engine.swarm.downloadSpeed();
-        const speedMb = (speedBps / 1024 / 1024).toFixed(2);
-        const peers = engine.swarm.wires.length;
-        const downloaded = (engine.swarm.downloaded / 1024 / 1024).toFixed(2);
-
-        if (parseFloat(speedMb) >= 0.1) entry.lastNonZeroSpeed = Date.now();
-
-        entry.speedSamples.push(parseFloat(speedMb));
-        if (entry.speedSamples.length > 6) entry.speedSamples.shift();
-        const avgSpeed = entry.speedSamples.reduce((a, b) => a + b, 0) / entry.speedSamples.length;
-
-        const currentLimits = getDynamicLimits(infoHash);
-        const prevLimit = entry._prevPeerLimit || currentLimits.connections;
-
-        if (engine.swarm.size !== currentLimits.connections) {
-            engine.swarm.size = currentLimits.connections;
-            if (engine.swarm.maxConnections) engine.swarm.maxConnections = currentLimits.connections;
-        }
-
-        const budgetJump = currentLimits.connections - prevLimit;
-        const timeSinceAnnounce = Date.now() - (entry._lastAnnounce || 0);
-        const needsMorePeers = peers < Math.floor(currentLimits.connections * 0.5);
-        if (budgetJump >= 10 && timeSinceAnnounce > 30000 && needsMorePeers) {
-            try {
-                if (engine.swarm?.announce) engine.swarm.announce();
-                if (engine.discovery?.lookup) engine.discovery.lookup();
-                if (engine.swarm?.resume) engine.swarm.resume();
-                entry._lastAnnounce = Date.now();
-                console.log(`[SpeedMgr:${infoHash.substring(0, 8)}] 📡 Peer Recovery: budget +${budgetJump}c (${prevLimit}c -> ${currentLimits.connections}c), peers: ${peers}`);
-            } catch (e) { /* ignore */ }
-        }
-        entry._prevPeerLimit = currentLimits.connections;
-
-        if (peers > currentLimits.connections) {
-            const ram = getRamUsageMB();
-            const underRamPressure = ram > RAM_LIMIT_MB * 0.8;
-            const hardOverLimit = peers > currentLimits.connections + 15;
-
-            if (underRamPressure || hardOverLimit) {
-                const targetPeers = Math.max(20, currentLimits.connections);
-                const excessCount = peers - targetPeers;
-                const HOG_THRESHOLD = 0.2 * 1024 * 1024;
-
-                const sortedWires = [...engine.swarm.wires].sort((a, b) => {
-                    const spdA = a.downloadSpeed ? a.downloadSpeed() : 0;
-                    const spdB = b.downloadSpeed ? b.downloadSpeed() : 0;
-                    const aIsValuable = spdA >= HOG_THRESHOLD ? 1 : 0;
-                    const bIsValuable = spdB >= HOG_THRESHOLD ? 1 : 0;
-                    if (aIsValuable !== bIsValuable) return aIsValuable - bIsValuable;
-                    return spdA - spdB;
-                });
-
-                let pruned = 0;
-                for (let i = 0; i < excessCount; i++) {
-                    if (sortedWires[i]) {
-                        const spd = sortedWires[i].downloadSpeed ? sortedWires[i].downloadSpeed() : 0;
-                        if (spd >= HOG_THRESHOLD) break;
-                        try { sortedWires[i].destroy(); pruned++; } catch (e) { }
-                    }
-                }
-                if (pruned > 0) {
-                    console.log(`[SpeedMgr:${infoHash.substring(0, 8)}] ✂️ Pruned ${pruned} slow peers (RAM pressure: ${ram}MB) | ${currentLimits.label}`);
-                }
-            }
-        }
-
-        slowPeerEvictionTick++;
-        if (slowPeerEvictionTick >= 6) {
-            slowPeerEvictionTick = 0;
-            const hasActiveStreams = entry.activeStreams > 0;
-            const swarmHealthy = peers > 15;
-
-            if (hasActiveStreams && swarmHealthy) {
-                let evicted = 0;
-                for (const wire of [...engine.swarm.wires]) {
-                    try {
-                        const peerSpeed = wire.downloadSpeed ? wire.downloadSpeed() : 0;
-                        if (peerSpeed === 0 && wire.peerChoking && peers - evicted > 15) {
-                            wire.destroy();
-                            evicted++;
-                        }
-                    } catch (e) { /* ignore */ }
-                }
-                if (evicted > 0) {
-                    console.log(`[SpeedMgr:${infoHash.substring(0, 8)}] 🚫 Evicted ${evicted} truly idle peers`);
-                }
-            }
-        }
-
-        if (parseFloat(speedMb) > 0 || peers > 0) {
-            const ramMB = getRamUsageMB();
-            const ramWarn = ramMB > (RAM_LIMIT_MB * 0.9) ? ' (!) RAM' : '';
-            console.log(`[Engine:${infoHash.substring(0, 8)}] ⚡ ${speedMb} MB/s | 👥 ${peers}p | ↓ ${downloaded} MB | 🎬 ${entry.activeStreams} active | avg:${avgSpeed.toFixed(2)}${ramWarn}`);
-        }
-    }, 5000);
-
-    if (!global._zombieScannerStarted) {
-        global._zombieScannerStarted = true;
-        setInterval(() => {
-            if (getRamUsageMB() > RAM_LIMIT_MB) {
-                console.log(`[Guard] Proactive RAM Check: ${getRamUsageMB()}MB exceeds ${RAM_LIMIT_MB}MB limit`);
-                evictIfNeeded();
-            }
-            const zombieAge = ZOMBIE_TIMEOUT / 1000;
-            for (const [hash, e] of Object.entries(activeEngines)) {
-                const timeSinceGoodSpeed = Date.now() - (e.lastNonZeroSpeed || 0);
-                const isStalled = timeSinceGoodSpeed > ZOMBIE_TIMEOUT;
-                const noStreams = e.activeStreams === 0;
-
-                if (noStreams && isStalled) {
-                    const avgSpeed = e.speedSamples?.length
-                        ? e.speedSamples.reduce((a, b) => a + b, 0) / e.speedSamples.length
-                        : 0;
-                    console.log(`[Zombie] Killing slow engine ${hash.substring(0, 8)}… (avg ${avgSpeed.toFixed(2)} MB/s for ${zombieAge}s)`);
-                    destroyEngine(hash);
-                } else if (e.activeStreams === 0 && e.speedSamples?.length >= 6) {
-                    const avgSpeed = e.speedSamples.reduce((a, b) => a + b, 0) / e.speedSamples.length;
-                    const age = Date.now() - (e.createdAt || Date.now());
-                    if (avgSpeed < 0.15 && age > 120000) {
-                        try {
-                            if (e.engine?.swarm?.announce) {
-                                e.engine.swarm.announce();
-                                console.log(`[SpeedMgr:${hash.substring(0, 8)}] 🔊 Re-announcing (avg ${avgSpeed.toFixed(2)} MB/s)`);
-                            }
-                        } catch (_) { /* ignore */ }
-                    }
-                }
-            }
-        }, 30 * 1000);
-    }
-
-    engine.on('ready', () => {
-        entry.isReady = true;
-        console.log(`[Engine] Ready: ${infoHash.substring(0, 8)}… (${engine.files.length} files)`);
-
-        engine.files.forEach(f => f.deselect());
-
-        let bestFile = null, bestSize = 0;
-        for (const f of engine.files) {
-            if (['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.webm', '.m4v'].some(e => f.name.toLowerCase().endsWith(e)) && f.length > bestSize) {
-                bestFile = f;
-                bestSize = f.length;
-            }
-        }
-
-        if (bestFile) {
-            bestFile.select();
-            console.log(`[Engine] Priority → "${bestFile.name}" (${(bestFile.length / 1024 / 1024).toFixed(0)} MB)`);
-
-            setTimeout(() => {
-                try {
-                    const WARMUP_BYTES = Math.min(20 * 1024 * 1024, bestFile.length - 1);
-                    const warmStream = bestFile.createReadStream({ start: 0, end: WARMUP_BYTES });
-                    warmStream.on('data', () => { });
-                    warmStream.on('end', () => console.log(`[SpeedMgr:${infoHash.substring(0, 8)}] 🔥 Pre-buffer complete (${(WARMUP_BYTES / 1024 / 1024).toFixed(0)}MB)`));
-                    warmStream.on('error', () => { });
-                } catch (e) { /* ignore */ }
-            }, 200);
-        }
-    });
-
-    return { engine, isReady: false };
-}
-
-// ─── Video file detection ─────────────────────────────────
-const VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v'];
-
-function isVideoFile(filename) {
-    const lower = filename.toLowerCase();
-    return VIDEO_EXTENSIONS.some(ext => lower.endsWith(ext));
-}
-
-function findVideoFile(files, fileIdx) {
-    if (fileIdx !== undefined && fileIdx !== null && files[fileIdx]) {
-        return files[fileIdx];
-    }
-    let bestFile = null, bestSize = 0;
-    for (const file of files) {
-        if (isVideoFile(file.name) && file.length > bestSize) {
-            bestFile = file;
-            bestSize = file.length;
-        }
-    }
-    return bestFile;
-}
-
-// ─── MKV/WebM → MP4 Real-Time Remux via FFmpeg ───────────
-// Container swap only — zero re-encoding, near-zero CPU overhead.
-// Outputs fragmented MP4 so Stremio can start playback immediately.
-// NOTE: Range/seek requests are not supported through the remux pipeline;
-//       Stremio degrades gracefully to sequential streaming.
-function remuxToMp4(file, req, res, infoHash) {
-    resetEngineTimeout(infoHash);
-
-    const entry = activeEngines[infoHash];
-    if (entry) entry.activeStreams++;
-
-    req.on('close', () => {
-        if (entry) {
-            entry.activeStreams = Math.max(0, entry.activeStreams - 1);
-            resetEngineTimeout(infoHash);
-        }
-    });
-
-    console.log(`[Remux] MKV→MP4 start: "${file.name}" (${(file.length / 1024 / 1024).toFixed(0)} MB)`);
-
-    // Spawn ffmpeg: stdin ← torrent stream, stdout → HTTP response
-    const ffmpeg = spawn('ffmpeg', [
-        '-re',                   // read at native framerate — prevents buffer floods
-        '-i', 'pipe:0',          // input from stdin (torrent stream)
-        '-map', '0:v:0',         // first video track
-        '-map', '0:a:0',         // first audio track
-        '-c', 'copy',            // NO re-encoding — rewrap container only
-        '-movflags', 'frag_keyframe+empty_moov+faststart+default_base_moof',
-        '-f', 'mp4',             // output as MP4
-        'pipe:1',                // output to stdout
-    ], { stdio: ['pipe', 'pipe', 'pipe'] });
-
-    // Respond with chunked MP4 — no Content-Length since size is unknown until remux completes
-    res.writeHead(200, {
-        'Content-Type':      'video/mp4',
-        'Transfer-Encoding': 'chunked',
-        'Connection':        'keep-alive',
-        'Cache-Control':     'no-store',
-        'X-Accel-Buffering': 'no',
-    });
-
-    // Pipe torrent data → ffmpeg stdin
-    const torrentReadStream = file.createReadStream({ highWaterMark: 4 * 1024 * 1024 });
-    torrentReadStream.pipe(ffmpeg.stdin);
-
-    // Pipe ffmpeg stdout → HTTP response
-    ffmpeg.stdout.pipe(res);
-
-    // Log only meaningful ffmpeg output — suppress per-frame spam
-    ffmpeg.stderr.on('data', (data) => {
-        const lines = data.toString().split('\n');
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            // Log errors and periodic progress (fps= lines appear every ~1s)
-            if (trimmed.includes('Error') || trimmed.includes('Invalid') ||
-                trimmed.includes('No such') || trimmed.startsWith('fps=')) {
-                console.log(`[FFmpeg:${infoHash.substring(0, 8)}] ${trimmed}`);
-            }
-        }
-    });
-
-    ffmpeg.on('error', (err) => {
-        console.error(`[Remux] FFmpeg spawn error (is ffmpeg installed?): ${err.message}`);
-        if (!res.writableEnded) res.end();
-    });
-
-    ffmpeg.on('close', (code) => {
-        console.log(`[Remux] FFmpeg exited (code ${code}): ${infoHash.substring(0, 8)}…`);
-        if (!res.writableEnded) res.end();
-    });
-
-    // Client disconnected — kill ffmpeg immediately to free resources
-    res.on('close', () => {
-        console.log(`[Remux] Client disconnected — killing ffmpeg: ${infoHash.substring(0, 8)}…`);
-        torrentReadStream.destroy();
-        try { ffmpeg.stdin.destroy(); } catch (e) { /* ignore */ }
-        try { ffmpeg.kill('SIGKILL'); } catch (e) { /* ignore */ }
-    });
-
-    torrentReadStream.on('error', (err) => {
-        console.error(`[Remux] Torrent read error: ${err.message}`);
-        try { ffmpeg.kill('SIGKILL'); } catch (e) { /* ignore */ }
-        if (!res.writableEnded) res.end();
-    });
-
-    ffmpeg.stdin.on('error', (err) => {
-        // EPIPE is expected when ffmpeg exits before stdin is fully consumed — ignore it
-        if (err.code !== 'EPIPE') {
-            console.error(`[Remux] stdin error: ${err.message}`);
-        }
-    });
-}
-
-// ─── Serve video file with Range support ─────────────────
-function serveVideoFile(file, req, res, infoHash) {
-    const ext = file.name.split('.').pop().toLowerCase();
-
-    // MKV and WebM containers → remux to fragmented MP4
-    // Stremio's built-in player cannot handle MKV/WebM natively
-    if (ext === 'mkv' || ext === 'webm') {
-        console.log(`[Stream] .${ext} detected — routing to remux pipeline: "${file.name}"`);
-        return remuxToMp4(file, req, res, infoHash);
-    }
-
-    // ── Native MP4/AVI/etc: serve directly with Range support ──
-    resetEngineTimeout(infoHash);
-
-    const entry = activeEngines[infoHash];
-    if (entry) entry.activeStreams++;
-
-    req.on('close', () => {
-        if (entry) {
-            entry.activeStreams = Math.max(0, entry.activeStreams - 1);
-            resetEngineTimeout(infoHash);
-        }
-    });
-
-    const totalSize = file.length;
-    const mimeTypes = {
-        mp4: 'video/mp4', mkv: 'video/x-matroska', avi: 'video/x-msvideo',
-        mov: 'video/quicktime', wmv: 'video/x-ms-wmv', flv: 'video/x-flv',
-        webm: 'video/webm', m4v: 'video/mp4',
-    };
-    const contentType = mimeTypes[ext] || 'application/octet-stream';
-    const rangeHeader = req.headers.range;
-
-    if (rangeHeader) {
-        const parts = rangeHeader.replace(/bytes=/, '').split('-');
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1;
-        const chunkSize = end - start + 1;
-
-        console.log(`[Stream] Range: ${start}-${end}/${totalSize} (${(chunkSize / 1024 / 1024).toFixed(1)} MB)`);
-
-        res.writeHead(206, {
-            'Content-Range': `bytes ${start}-${end}/${totalSize}`,
-            'Accept-Ranges': 'bytes',
-            'Content-Length': chunkSize,
-            'Content-Type': contentType,
-            'Connection': 'keep-alive',
-            'Keep-Alive': 'timeout=30, max=1000',
-            'Cache-Control': 'no-store',
-        });
-
-        const stream = file.createReadStream({ start, end, highWaterMark: 8 * 1024 * 1024 });
-        stream.pipe(res);
-        stream.on('error', (err) => {
-            console.error(`[Stream Error] ${infoHash.substring(0, 8)} Read error: ${err.message}`);
-            if (!res.headersSent) res.status(500).end();
-        });
-        res.on('close', () => stream.destroy());
-    } else {
-        console.log(`[Stream] Full file: ${(totalSize / 1024 / 1024).toFixed(1)} MB`);
-
-        res.writeHead(200, {
-            'Content-Length': totalSize,
-            'Content-Type': contentType,
-            'Accept-Ranges': 'bytes',
-            'Connection': 'keep-alive',
-            'Keep-Alive': 'timeout=30, max=1000',
-            'Cache-Control': 'no-store',
-        });
-
-        const stream = file.createReadStream({ highWaterMark: 8 * 1024 * 1024 });
-        stream.pipe(res);
-        stream.on('error', (err) => {
-            console.error(`[Stream Error] ${infoHash.substring(0, 8)} Read error: ${err.message}`);
-            if (!res.headersSent) res.status(500).end();
-        });
-        res.on('close', () => stream.destroy());
-    }
-}
-
-// ─── Stream Proxy Routes ──────────────────────────────────
-
-// HEAD handler — Stremio probes this before GET to validate the URL.
-// Respond immediately with MP4 headers (covers MKV too since we remux)
-// and kick off engine pre-warming so GET arrives to a warm engine.
-app.head('/stream/:infoHash', (req, res) => {
-    const { infoHash } = req.params;
-    console.log(`[Stream] HEAD ${infoHash.substring(0, 8)}… — responding immediately + pre-warming`);
-
-    if (!activeEngines[infoHash]) {
-        setImmediate(() => getOrCreateEngine(infoHash));
-    }
-
-    // Always advertise MP4 — MKV files are remuxed transparently
-    res.writeHead(200, {
-        'Content-Type':      'video/mp4',
-        'Accept-Ranges':     'bytes',
-        'Connection':        'keep-alive',
-        'Cache-Control':     'no-store',
-        'X-Accel-Buffering': 'no',
-    });
+  if (req.method === 'OPTIONS') {
+    res.writeHead(200, corsHeaders);
     res.end();
-});
+    return;
+  }
 
-app.get('/stream/:infoHash', (req, res) => {
-    const { infoHash } = req.params;
-    const fileIdx = req.query.fileIdx !== undefined ? parseInt(req.query.fileIdx, 10) : undefined;
+  const parsedUrl = url.parse(req.url, true);
 
-    console.log(`[Stream] GET ${infoHash.substring(0, 8)}… fileIdx=${fileIdx}`);
+  if (parsedUrl.pathname === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('🟢 StreamP2P Proxy Server Running');
+    return;
+  }
 
-    // Kill all socket-level timeouts immediately
-    req.socket.setTimeout(0);
-    req.socket.setKeepAlive(true, 1000);
-    res.setTimeout(0);
+  // Debug logging for likes endpoints
+  console.log(`🔍 Checking route: ${parsedUrl.pathname}, Method: ${req.method}`);
 
-    const { engine, isReady } = getOrCreateEngine(infoHash);
-    engine.setMaxListeners(30);
+  if (parsedUrl.pathname === '/api/movie/like' && req.method === 'POST') {
+    console.log('✅ Matched POST /api/movie/like route');
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        console.log('📨 Like request data:', data);
+        handleLikeRequest(req, res, data.movieId);
+      } catch (err) {
+        console.error('❌ JSON parse error:', err);
+        res.writeHead(400, corsHeaders);
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      }
+    });
+    return;
+  }
 
-    // ── Fast path: engine already ready (pre-warmed by HEAD) ─
-    if (isReady && engine.files?.length > 0) {
-        console.log(`[Stream] ✅ Pre-warmed hit — serving instantly`);
-        const file = findVideoFile(engine.files, fileIdx);
-        if (!file) return res.status(404).json({ error: 'No video file found in this torrent' });
-        return serveVideoFile(file, req, res, infoHash);
+  if (parsedUrl.pathname === '/api/movie/likes' && req.method === 'GET') {
+    console.log('✅ Matched GET /api/movie/likes route');
+    const movieId = parsedUrl.query.movieId;
+    console.log('📨 Get likes for movieId:', movieId);
+    handleGetLikes(req, res, movieId);
+    return;
+  }
+
+  if (parsedUrl.pathname === '/api/campaign/submissions' && req.method === 'GET') {
+    const sanitized = campaignSubmissions.map((submission) => ({
+      submissionId: submission.submissionId,
+      instagramUsername: submission.instagramUsername,
+      reelUrl: submission.reelUrl,
+      notes: submission.notes,
+      timestamp: submission.timestamp,
+      status: submission.status,
+      qrCodePath: submission.qrCodePath,
+    }));
+    res.writeHead(200, corsHeaders);
+    res.end(JSON.stringify({ total: sanitized.length, submissions: sanitized }));
+    return;
+  }
+
+  if (parsedUrl.pathname === '/api/campaign/submissions' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body || '{}');
+        const instagramUsername = String(payload.instagramUsername || '').trim();
+        const reelUrl = String(payload.reelUrl || '').trim();
+        const notes = String(payload.notes || '').trim();
+        const qrImageData = String(payload.qrImageData || '').trim();
+
+        const reelRegex = /^https?:\/\/(www\.)?instagram\.com\/(reel|reels)\/[A-Za-z0-9_-]+\/?(\?.*)?$/i;
+        if (!instagramUsername || !reelRegex.test(reelUrl)) {
+          res.writeHead(400, corsHeaders);
+          res.end(JSON.stringify({ error: 'Invalid username or Instagram reel URL' }));
+          return;
+        }
+
+        const imageData = decodeBase64Image(qrImageData);
+        if (!imageData || imageData.buffer.length > 5 * 1024 * 1024) {
+          res.writeHead(400, corsHeaders);
+          res.end(JSON.stringify({ error: 'Invalid QR image format or size' }));
+          return;
+        }
+
+        const submissionId = generateSubmissionId();
+        const filename = `${submissionId}.${imageData.extension}`;
+        const filePath = path.join(campaignUploadsDir, filename);
+        fs.writeFileSync(filePath, imageData.buffer);
+
+        const entry = {
+          submissionId,
+          instagramUsername,
+          reelUrl,
+          notes,
+          timestamp: new Date().toISOString(),
+          status: 'pending',
+          qrCodePath: `/campaign-uploads/${filename}`,
+        };
+
+        campaignSubmissions.unshift(entry);
+        saveCampaignSubmissions();
+
+        res.writeHead(201, corsHeaders);
+        res.end(JSON.stringify({
+          message: 'Campaign submission stored successfully',
+          submissionId,
+          status: entry.status,
+        }));
+      } catch (err) {
+        console.error('❌ Submission parse/save error:', err.message);
+        res.writeHead(500, corsHeaders);
+        res.end(JSON.stringify({ error: 'Failed to process campaign submission' }));
+      }
+    });
+    return;
+  }
+
+  if (parsedUrl.pathname === '/api/stream/match') {
+    const slug = parsedUrl.query.slug || '';
+    const tmdbId = parsedUrl.query.tmdbId || null;
+    const { title, season, episode } = parseSlugParts(slug);
+
+    const searchPath = `/api/v1/video/manage?page=1&perPage=200&search=${encodeURIComponent(title)}`;
+    console.log(`➡️ Slug: "${slug}" → "${title}" S${season || 'null'}E${episode || 'null'}, TMDB: ${tmdbId}`);
+
+    const options = {
+      hostname: 'streamp2p.com',
+      path: searchPath,
+      method: 'GET',
+      headers: {
+        'api-token': API_TOKEN,
+        'User-Agent': 'MoonflixProxy/1.0'
+      }
+    };
+
+    const proxyReq = https.request(options, (proxyRes) => {
+      let body = '';
+
+      proxyRes.on('data', chunk => body += chunk);
+      proxyRes.on('end', () => {
+        try {
+          const result = JSON.parse(body);
+          const all = result.data || [];
+          const normalizedSlug = normalize(title);
+
+          const match = all.find(item => {
+            const filename = item.name.toLowerCase();
+            const { season: fileSeason, episode: fileEpisode } = extractSeasonEpisode(filename);
+            const normalizedFilename = normalize(filename);
+
+            const hasTMDB = tmdbId && filename.includes(`{${tmdbId}}`);
+            const seasonMatch = season && fileSeason && season === fileSeason;
+            const episodeMatch = episode && fileEpisode && episode === fileEpisode;
+
+            // ✅ Primary: TMDB match + season + episode
+            if (hasTMDB && season && episode) {
+              return seasonMatch && episodeMatch;
+            }
+
+            // 🟡 Fallback: fuzzy title match + optional S/E
+            const titleMatch = normalizedFilename.includes(normalizedSlug);
+            return titleMatch && (!season || seasonMatch) && (!episode || episodeMatch);
+          });
+
+          if (match) {
+            console.log(`✅ Matched: ${match.name}`);
+
+            // Build download URL
+            const downloadUrl = `https://moonflix.p2pplay.pro/#${match.id}&dl=1`;
+
+            res.writeHead(200, corsHeaders);
+            res.end(JSON.stringify({
+              data: [{
+                ...match,
+                downloadUrl
+              }]
+            }));
+          } else {
+            console.warn('⚠️ No accurate match found');
+            res.writeHead(200, corsHeaders);
+            res.end(JSON.stringify({ data: [] }));
+          }
+        } catch (err) {
+          console.error('❌ JSON parse error:', err.message);
+          res.writeHead(500, corsHeaders);
+          res.end(JSON.stringify({ error: 'Parse error', details: err.message }));
+        }
+      });
+    });
+
+    proxyReq.on('error', (err) => {
+      console.error('❌ Proxy error:', err.message);
+      res.writeHead(500, corsHeaders);
+      res.end(JSON.stringify({ error: 'Proxy failed', details: err.message }));
+    });
+
+    proxyReq.end();
+    return;
+  }
+
+  if (parsedUrl.pathname.startsWith('/campaign-uploads/') && req.method === 'GET') {
+    const safeName = path.basename(parsedUrl.pathname);
+    const filePath = path.join(campaignUploadsDir, safeName);
+    if (!fs.existsSync(filePath)) {
+      res.writeHead(404, corsHeaders);
+      res.end(JSON.stringify({ error: 'File not found' }));
+      return;
     }
 
-    // ── Slow path: wait for engine ready, then serve directly ─
-    // Hold the connection open (res.setTimeout(0) is already set).
-    // Once ready, call serveVideoFile directly — no chunked dance,
-    // no retry needed. MP4 files get proper 206 range support;
-    // MKV files go through the remux pipeline.
-    let responded = false;
+    const ext = path.extname(filePath).toLowerCase();
+    const contentType = ext === '.png'
+      ? 'image/png'
+      : ext === '.webp'
+        ? 'image/webp'
+        : 'image/jpeg';
 
-    const cleanup = () => {
-        engine.removeListener('ready', onReady);
-        engine.removeListener('error', onError);
-        clearTimeout(timer);
-    };
-
-    const onReady = () => {
-        if (responded) return;
-        responded = true;
-        cleanup();
-
-        const file = findVideoFile(engine.files, fileIdx);
-        if (!file) {
-            console.error(`[Stream] No video file found: ${infoHash.substring(0, 8)}…`);
-            return res.status(404).json({ error: 'No video file found in this torrent' });
-        }
-
-        console.log(`[Stream] ✅ Engine ready — serving: "${file.name}"`);
-        serveVideoFile(file, req, res, infoHash);
-    };
-
-    const onError = (err) => {
-        if (responded) return;
-        responded = true;
-        cleanup();
-        console.error(`[Engine Error] ${infoHash.substring(0, 8)}: ${err.message}`);
-        if (!res.headersSent) res.status(500).json({ error: 'Engine error' });
-        else res.end();
-    };
-
-    engine.once('ready', onReady);
-    engine.once('error', onError);
-
-    // Bail after 75s — Railway proxy kills idle connections at ~100s
-    const timer = setTimeout(() => {
-        if (responded) return;
-        responded = true;
-        cleanup();
-        console.error(`[Stream] ⏰ Timeout (75s): ${infoHash.substring(0, 8)}…`);
-        if (!res.headersSent) res.status(504).json({ error: 'Engine timed out connecting to peers' });
-        else res.end();
-    }, CONNECT_TIMEOUT);
-
-    req.on('close', () => {
-        if (!responded) {
-            responded = true;
-            cleanup();
-        }
-        console.log(`[Stream] Client disconnected: ${infoHash.substring(0, 8)}…`);
+    res.writeHead(200, {
+      'Access-Control-Allow-Origin': '*',
+      'Content-Type': contentType,
+      'Cache-Control': 'public, max-age=86400',
     });
+    fs.createReadStream(filePath).pipe(res);
+    return;
+  }
+
+  res.writeHead(404, corsHeaders);
+  res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-// ─── Start Server ────────────────────────────────────────
-app.listen(PORT, () => {
-    const baseUrl = process.env.RENDER_EXTERNAL_URL
-        || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null)
-        || `http://localhost:${PORT}`;
-    console.log(`
-╔══════════════════════════════════════════════════════╗
-║             🎬 Torrent to weblink 🎬              ║
-╠══════════════════════════════════════════════════════╣
-║                                                      ║
-║  Server running on port ${String(PORT).padEnd(28)}  ║
-║                                                      ║
-║  Manifest URL:                                       ║
-║  ${(baseUrl + '/manifest.json').padEnd(52)}║
-║                                                      ║
-║  Install in Stremio:                                 ║
-║  Open Stremio → Addons → paste the manifest URL      ║
-║                                                      ║
-╚══════════════════════════════════════════════════════╝
-    `);
+server.listen(PORT, () => {
+  console.log(`🚀 Server running at http://localhost:${PORT}`);
 });
